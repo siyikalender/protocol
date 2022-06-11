@@ -43,6 +43,8 @@ For more information, please refer to <http://unlicense.org>
 
 #ifndef DEBUG
 
+#include "builtin.h"
+
 #define ntohs(inval) BSWAP16(inval)
 #define htons(inval) BSWAP16(inval)
 
@@ -310,6 +312,12 @@ step
     {
       // No immediate response is required. Process user packets per step (! TO-DO:Check tx busy)
       TRACE(__FUNCTION__ << ": Process user packets\n");
+
+      TRACE(__FUNCTION__ 
+            << "* i.tx_buffer_descriptors.size():" 
+            << i.tx_buffer_descriptors.size() << "," 
+            << i.tx_buffer_descriptors.empty() << "," 
+            << i.tx_buffer_descriptors.full() << "\n");
       
       while(!i.tx_buffer_descriptors.empty())
       {
@@ -322,17 +330,25 @@ step
           default:break;
           case PROTOCOL_UDP:
             TRACE(__FUNCTION__ << ": Paket is UDP\n");
-
-            write_udp_packet(i, bd);
             
+            write_udp_packet(i, bd);
+
             write
             (
               i.tx_frame_buffer, 
               i.tx_frame_size
             );
             
+            i.tx_frame_size = 0U;
+
             break;
         }
+        
+        TRACE(__FUNCTION__ 
+              << "+ i.tx_buffer_descriptors.size():" 
+              << i.tx_buffer_descriptors.size() << "," 
+              << i.tx_buffer_descriptors.empty() << "," 
+              << i.tx_buffer_descriptors.full() << "\n");
         
         i.tx_buffer_descriptors.pop();
       }

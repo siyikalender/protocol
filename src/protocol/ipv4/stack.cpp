@@ -134,7 +134,7 @@ write_arp_response
   const arp_packet*   in_arp_ptr
 )
 {
-  i.tx_frame_size = c_min_eth_frame_size;
+  i.tx_frame_size = sizeof(eth_packet_header) + sizeof(arp_packet);
   
   uint8_t           *ptr  = &i.tx_frame_buffer[0];
   eth_packet_header *eth  = (eth_packet_header*) ptr;
@@ -188,7 +188,7 @@ write_icmp_echo_packet
   eth->type                 = htons(0x800);
   ip->version_length        = 0x45;
   ip->diff_serv             = 0;
-  ip->total_length          = htons(i.tx_frame_size - 2);
+  ip->total_length          = htons(i.tx_frame_size - sizeof(eth_packet_header));
   ip->identification        = htons(g_ip_identification++);
   ip->flags_fragment_offset = 0;
   ip->protocol              = PROTOCOL_ICMP;
@@ -202,9 +202,10 @@ write_icmp_echo_packet
   icmp->checksum            = 0; // default
   icmp->identifier          = in_icmp_ptr->identifier;
   icmp->sequence_number     = in_icmp_ptr->sequence_number;
-  icmp->checksum            = calculate_checksum( (uint16_t *) icmp, sizeof(icmp_packet));
-  
+
   std::memcpy(echo, ctxt.ptr, echo_size);
+
+  icmp->checksum            = calculate_checksum( (uint16_t *) icmp, sizeof(icmp_packet) + echo_size);
 }
 
 std::optional<arp_table_entry*>
@@ -252,8 +253,6 @@ write_udp_packet
       sizeof(udp_packet) + 
       bd.size;
 
-    len = std::max(uint32_t(len), uint32_t(60));
-
     if (len <= c_max_eth_frame_size)
     {
       unsigned char       *ptr      = (unsigned char*) &i.tx_frame_buffer[0];
@@ -296,8 +295,6 @@ write_udp_packet
         read_size, 
         bd.first
       );
-
-      i.tx_buffer_descriptors.pop();
 
       checksum    udp_checksum;
       // psuedo header 
@@ -443,23 +440,29 @@ process_udp_packet
     auto first = (i.rx_buffer_descriptors.size() > 0) ? i.rx_buffer_descriptors.back().last : 0;
     auto last  = copy_to_payload_buffer(i.rx_payload_buffer, ctxt.ptr, size, first);
 
-    i.rx_buffer_descriptors.push
-    (
-      buffer_descriptor
-      {
-        first, 
-        last,
-        size,
-        endpoint
+    if (!i.rx_buffer_descriptors.full())
+    {
+      i.rx_buffer_descriptors.push
+      (
+        buffer_descriptor
         {
-          ip_ptr->src_ip,
-          udp_ptr->src_port
-        },
-        udp_ptr->src_port,
-        protocol::ipv4::PROTOCOL_UDP
-      }
-    );
-    
+          first, 
+          last,
+          size,
+          endpoint
+          {
+            ip_ptr->src_ip,
+            udp_ptr->src_port
+          },
+          udp_ptr->src_port,
+          protocol::ipv4::PROTOCOL_UDP
+        }
+      );
+    }
+    else
+    {
+      TRACE("ERROR! Overflow");
+    }
   }
   else
   {
@@ -487,8 +490,8 @@ process_ip_packet
     ip->total_length = ntohs(ip->total_length);
     
     TRACE("IP Packet Total Length:" << ip->total_length << "\n");
-    TRACE("IP DEST IP:" << ip->dest_ip);
-    TRACE("IP SRC  IP:" << ip->src_ip);
+    TRACE("IP DEST IP:" << ip->dest_ip << "\n");
+    TRACE("IP SRC  IP:" << ip->src_ip << "\n");
     TRACE("IP PROTO  :" << uint32_t(ip->protocol) << "\n");
 
     if (ip->dest_ip == g_interfaces[0].ip_addr)
@@ -651,11 +654,13 @@ received_length
     {
       interface &i = g_interfaces[p.ifd];
       
-      auto &bd = i.rx_buffer_descriptors.front();
+      TRACE( __FUNCTION__ << " i.rx_buffer_descriptor.size() " << i.rx_buffer_descriptors.size() << " \n" );
       
-      // auto d  = haluj::cyclic_distance(f.first, f.last, rx_payload_buffer.capacity());
-      
-      result = bd.size;
+      if (!i.rx_buffer_descriptors.empty())
+      {
+        auto &bd = i.rx_buffer_descriptors.front();
+        result = bd.size;
+      }
     }
     else
     {
@@ -685,7 +690,7 @@ receive
     {
       interface &i = g_interfaces[p.ifd];
       
-      if ( i.rx_buffer_descriptors.size() > 0 )
+      if ( !i.rx_buffer_descriptors.empty() )
       {
         auto &bd  = i.rx_buffer_descriptors.front();
 
@@ -698,6 +703,8 @@ receive
           read_size, 
           bd.first
         );
+        
+        remote = bd.remote;
 
         i.rx_buffer_descriptors.pop();
 
@@ -734,23 +741,30 @@ send
       auto first = (i.tx_buffer_descriptors.size() > 0) ? i.tx_buffer_descriptors.back().last : 0;
       auto last  = copy_to_payload_buffer(i.tx_payload_buffer, data, size, first);
 
-      i.tx_buffer_descriptors.push
-      (
-        buffer_descriptor
-        {
-          first, 
-          last,
-          size,
-          remote,
-          p.port,
-          protocol::ipv4::PROTOCOL_UDP
-        }
-      );      
+      if (!i.tx_buffer_descriptors.full())
+      {
+        i.tx_buffer_descriptors.push
+        (
+          buffer_descriptor
+          {
+            first, 
+            last,
+            size,
+            remote,
+            p.port,
+            protocol::ipv4::PROTOCOL_UDP
+          }
+        );      
+      } 
+      else
+      {
+        TRACE("ERROR! Transmit overflow\n");
+      }
     }
   }
   else
   {
-    TRACE("Endpoint invalid");
+    TRACE("Endpoint invalid\n");
   }
 }
 
