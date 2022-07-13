@@ -37,6 +37,7 @@ For more information, please refer to <http://unlicense.org>
 #include <tuple>
 
 #include "protocol/ipv4/stack.hpp"
+#include "protocol/ipv4/bd.hpp"
 
 namespace protocol
 {
@@ -44,7 +45,7 @@ namespace protocol
 namespace ipv4
 {
 
-interface_container_type      g_interfaces;
+interface_container           g_interfaces;
 arp_table_type                g_arp_table; 
 udp_ports_table_type          g_udp_ports; 
 std::size_t                   g_ip_identification;
@@ -64,74 +65,12 @@ uint16_t calculate_checksum(uint16_t *ptr, unsigned size)
   return ~sum;
 }
 
-template
-<
-  typename DstContainer,
-  typename SrcContainer
->
-std::size_t
-copy_from_payload_buffer
-(
-  DstContainer&       dest, 
-  const SrcContainer& src, 
-  std::size_t         size, 
-  std::size_t         first
-)
-{
-  std::size_t last = first + size;
-
-  if (last <= src.size())
-  {
-    std::memcpy(&dest[0], &src[first], size);
-  }
-  else
-  {
-    last -= src.size();
-    auto n = size - last;
-    std::memcpy(&dest[0], &src[first], n);
-    std::memcpy(&dest[n], &src[0],     last);
-  }
-  
-  return last;
-}
-
-template
-<
-  typename DstContainer,
-  typename SrcContainer
->
-std::size_t
-copy_to_payload_buffer
-(
-  DstContainer&       dest, 
-  const SrcContainer& src, 
-  std::size_t         size, 
-  std::size_t         first
-)
-{
-  std::size_t last = first + size;
-
-  if (last <= dest.size())
-  {
-    std::memcpy(&dest[first], &src[0], size);
-  }
-  else
-  {
-    last -= dest.size();
-    auto n = size - last;
-    std::memcpy(&dest[first], &src[0], n);
-    std::memcpy(&dest[0],     &src[n], last);
-  }
-  
-  return last;
-}
-
 void 
-write_arp_response
+write_arp_packet
 (
   interface&          i,
-  const context&      ctxt, 
-  const arp_packet*   in_arp_ptr
+  arp_table_entry&    e,
+  const bool          is_response
 )
 {
   i.tx_frame_size = sizeof(eth_packet_header) + sizeof(arp_packet);
@@ -140,7 +79,7 @@ write_arp_response
   eth_packet_header *eth  = (eth_packet_header*) ptr;
   arp_packet        *arp  = (arp_packet*) (ptr + sizeof(eth_packet_header));
 
-  eth->dest_hw_addr       = ctxt.remote_hw_addr;
+  eth->dest_hw_addr       = e.hw_addr;
   eth->source_hw_addr     = i.hw_addr;
   eth->type               = htons(0x806);
   
@@ -148,12 +87,12 @@ write_arp_response
   arp->ptype              = htons(0x0800);
   arp->hlen               = 6;
   arp->plen               = 4;
-  arp->opcode             = htons(0x0002);
+  arp->opcode             = (is_response) ? htons(0x0002) : htons(0x0001);
   
   arp->sender_hw_addr     = i.hw_addr;
   arp->sender_ip_addr     = i.ip_addr;
-  arp->target_hw_addr     = in_arp_ptr->sender_hw_addr;
-  arp->target_ip_addr     = in_arp_ptr->sender_ip_addr;
+  arp->target_hw_addr     = e.hw_addr;
+  arp->target_ip_addr     = e.ip_addr;
   
   TRACE("My HW Addr : " << i.hw_addr << "\n");
 }
@@ -191,7 +130,7 @@ write_icmp_echo_packet
   ip->total_length          = htons(i.tx_frame_size - sizeof(eth_packet_header));
   ip->identification        = htons(g_ip_identification++);
   ip->flags_fragment_offset = 0;
-  ip->protocol              = PROTOCOL_ICMP;
+  ip->protocol              = ICMP;
   ip->ttl                   = 0x80;
   ip->src_ip                = i.ip_addr;
   ip->dest_ip               = in_ip_ptr->src_ip;
@@ -208,13 +147,13 @@ write_icmp_echo_packet
   icmp->checksum            = calculate_checksum( (uint16_t *) icmp, sizeof(icmp_packet) + echo_size);
 }
 
-std::optional<arp_table_entry*>
+arp_table_entry_ref
 find_arp_entry
 (
   const address& a
 )
 {
-  std::optional<arp_table_entry*>  result;
+  arp_table_entry_ref  result;
   
   auto it = std::find_if
   (
@@ -228,7 +167,7 @@ find_arp_entry
 
   if (it != std::end(g_arp_table))
   {
-    result = &(*it);
+    result = (*it);
   }
   
   return result;
@@ -237,84 +176,64 @@ find_arp_entry
 void 
 write_udp_packet
 (
-  interface&          i, 
-  buffer_descriptor&  bd
+  interface&          i,
+  arp_table_entry&    e, 
+  buffer_descriptor&  bd  
 )
 {
-  auto e = find_arp_entry(bd.remote.ip_addr);
-  
-  if ( e )
+  std::size_t len = 
+    sizeof(ip_packet) + 
+    sizeof(eth_packet_header) + 
+    sizeof(udp_packet) + 
+    bd.size;
+
+  if (len <= c_max_eth_frame_size)
   {
-    TRACE("Found in ARP Table\n");
+    unsigned char       *ptr      = (unsigned char*) &i.tx_frame_buffer[0];
+    eth_packet_header   *eth      = (eth_packet_header*) ptr;
+    ip_packet           *ip       = (ip_packet*) (ptr + sizeof(eth_packet_header));
+    udp_packet          *udp      = (udp_packet*) (ptr + sizeof(ip_packet) + sizeof(eth_packet_header));
+    unsigned char       *payload  = (ptr +  sizeof(ip_packet) + sizeof(eth_packet_header) + sizeof(udp_packet));
+    
+    i.tx_frame_size = len;
+    
+    eth->dest_hw_addr         = e.hw_addr;
+    eth->source_hw_addr       = i.hw_addr;
 
-    std::size_t len = 
-      sizeof(ip_packet) + 
-      sizeof(eth_packet_header) + 
-      sizeof(udp_packet) + 
-      bd.size;
+    eth->type                 = htons(0x800);
+    ip->version_length        = 0x45;
+    ip->diff_serv             = 0;
+    ip->total_length          = htons(i.tx_frame_size - sizeof(eth_packet_header));
+    ip->identification        = htons(g_ip_identification++);
+    ip->flags_fragment_offset = 0x0040;
+    ip->protocol              = UDP;
+    ip->ttl                   = 0x80;
+    ip->src_ip                = i.ip_addr;
+    ip->dest_ip               = e.ip_addr;
+    ip->checksum              = 0;
+    ip->checksum              = calculate_checksum( (uint16_t *) ip, 20);
 
-    if (len <= c_max_eth_frame_size)
-    {
-      unsigned char       *ptr      = (unsigned char*) &i.tx_frame_buffer[0];
-      eth_packet_header   *eth      = (eth_packet_header*) ptr;
-      ip_packet           *ip       = (ip_packet*) (ptr + sizeof(eth_packet_header));
-      udp_packet          *udp      = (udp_packet*) (ptr + sizeof(ip_packet) + sizeof(eth_packet_header));
-      unsigned char       *payload  = (ptr +  sizeof(ip_packet) + sizeof(eth_packet_header) + sizeof(udp_packet));
-      
-      i.tx_frame_size = len;
-      
-      eth->dest_hw_addr         = (*e)->hw_addr;
-      eth->source_hw_addr       = i.hw_addr;
+    udp->src_port             = htons(bd.port);
+    udp->dest_port            = htons(bd.remote.port);
+    udp->length               = htons(sizeof(udp_packet) + bd.size);
+    udp->checksum             = 0;
 
-      eth->type                 = htons(0x800);
-      ip->version_length        = 0x45;
-      ip->diff_serv             = 0;
-      ip->total_length          = htons(i.tx_frame_size - sizeof(eth_packet_header));
-      ip->identification        = htons(g_ip_identification++);
-      ip->flags_fragment_offset = 0x0040;
-      ip->protocol              = PROTOCOL_UDP;
-      ip->ttl                   = 0x80;
-      ip->src_ip                = i.ip_addr;
-      ip->dest_ip               = bd.remote.ip_addr;
-      ip->checksum              = 0;
-      ip->checksum              = calculate_checksum( (uint16_t *) ip, 20);
+    std::memcpy(payload, bd.first, bd.size);
+    
+    checksum    udp_checksum;
+    // psuedo header 
+    udp_checksum.append(&ip->src_ip, sizeof(ip->src_ip));
+    udp_checksum.append(&ip->dest_ip, sizeof(ip->src_ip));
+    udp_checksum.append(htons(uint16_t(ip->protocol)));
+    udp_checksum.append(udp->length);
+    udp_checksum.append(udp, sizeof(udp_packet) + bd.size);
+    udp->checksum             = udp_checksum.finalize();
 
-      udp->src_port             = htons(bd.port);
-      udp->dest_port            = htons(bd.remote.port);
-      udp->length               = htons(sizeof(udp_packet) + bd.size);
-      udp->checksum             = 0;
-
-      auto &bd  = i.tx_buffer_descriptors.front();
-
-      auto read_size = std::min(i.tx_frame_size, bd.size);
-
-      copy_from_payload_buffer
-      (
-        payload, 
-        i.tx_payload_buffer, 
-        read_size, 
-        bd.first
-      );
-
-      checksum    udp_checksum;
-      // psuedo header 
-      udp_checksum.append(&ip->src_ip, sizeof(ip->src_ip));
-      udp_checksum.append(&ip->dest_ip, sizeof(ip->src_ip));
-      udp_checksum.append(htons(uint16_t(ip->protocol)));
-      udp_checksum.append(udp->length);
-      udp_checksum.append(udp, sizeof(udp_packet) + bd.size);
-      udp->checksum             = udp_checksum.finalize();
-      
-      TRACE("UDP packet size:" << bd.size << "\n");
-    }
-    else
-    {
-      TRACE("UDP packet too big:" << bd.size << "\n");
-    }
+    TRACE(__FUNCTION__ << " UDP payload size:" << bd.size << "\n");
   }
   else
   {
-    TRACE("Not found in ARP Table\n");
+    TRACE(__FUNCTION__ << " UDP packet too big:" << bd.size << "\n");
   }
 }
 
@@ -338,38 +257,55 @@ process_arp_packet
   
   TRACE("Target IP (" << arp->target_ip_addr << ") == My IP(" << i.ip_addr << ")\n");
 
-  if (arp->opcode == 1 &&
+  if (// arp->opcode == 1 &&
       arp->htype  == 1 &&
       arp->ptype  == 0x800 &&
       arp->hlen   == 6 &&
       arp->plen   == 4 &&
       arp->target_ip_addr == i.ip_addr)
   {
-    auto e = 
-      haluj::bounded::push_back
-      (
-        g_arp_table,
-        arp_table_entry
-        {
-          arp->sender_hw_addr,
-          arp->sender_ip_addr
-        }
-      );
-
-    if (e)
+    auto e_ref = find_arp_entry( arp->sender_ip_addr );
+    
+    if (e_ref)
     {
-      TRACE("ARP Entry added\n");
+      // exists in table
+      // update the entry
+      arp_table_entry &e = *e_ref;
+      e.set_complete();
+      e.hw_addr    = arp->sender_hw_addr;
     }
     else
     {
-      TRACE("ARP Entry add failed\n");
+      // new entry
+      auto r = 
+        haluj::bounded::push_back
+        (
+          g_arp_table,
+          arp_table_entry
+          {
+            arp->sender_hw_addr,
+            arp->sender_ip_addr,
+            true
+          }
+        );
+      if (r)
+      {
+        TRACE("ARP Entry added\n");
+        e_ref = g_arp_table.back();
+      }
+      else
+      {
+        TRACE("ARP Entry add failed\n");
+      }
     }
     
-    write_arp_response(i, ctxt, arp);
-  }
-  else if (arp->opcode == 2)
-  {
-    // Response
+    if ( (arp->opcode == 1) && e_ref)
+    {
+      // is request
+      arp_table_entry &e = *e_ref;
+      // write response 
+      write_arp_packet(i, e, true);
+    }
   }
 }
 
@@ -436,32 +372,40 @@ process_udp_packet
   )
   {
     TRACE("UDP Valid\n");
-    
-    auto first = (i.rx_buffer_descriptors.size() > 0) ? i.rx_buffer_descriptors.back().last : 0;
-    auto last  = copy_to_payload_buffer(i.rx_payload_buffer, ctxt.ptr, size, first);
 
-    if (!i.rx_buffer_descriptors.full())
+    if (!it->rx_buffer_descriptor_refs.full())
     {
-      i.rx_buffer_descriptors.push
-      (
-        buffer_descriptor
-        {
-          first, 
-          last,
-          size,
+
+      auto bd_ref = 
+        allocate_bd
+        (
+          i.rx_payload_buffer, 
+          i.rx_buffer_descriptors, 
+          size
+        );
+      
+      if (bd_ref)
+      {
+        buffer_descriptor &bd = *bd_ref;
+        
+        std::memcpy(bd.first, ctxt.ptr, size);
+
+        bd.remote = 
           endpoint
           {
             ip_ptr->src_ip,
             udp_ptr->src_port
-          },
-          udp_ptr->src_port,
-          protocol::ipv4::PROTOCOL_UDP
-        }
-      );
-    }
-    else
-    {
-      TRACE("ERROR! Overflow");
+          };
+
+        bd.port         = udp_ptr->dest_port;
+        bd.ip_protocol  = UDP;
+
+        it->rx_buffer_descriptor_refs.push(bd_ref);
+      }
+      else
+      {
+        TRACE(__FUNCTION__ << " : ERROR! Cannot allocate Buffer Descriptor\n");
+      }
     }
   }
   else
@@ -496,11 +440,11 @@ process_ip_packet
 
     if (ip->dest_ip == g_interfaces[0].ip_addr)
     {
-      if (ip->protocol == PROTOCOL_UDP) 
+      if (ip->protocol == UDP) 
       {
         process_udp_packet(i, ctxt, ip);
       }
-      else if (ip->protocol == PROTOCOL_ICMP) 
+      else if (ip->protocol == ICMP) 
       {
         process_icmp_packet(i, ctxt, ip);
       }
@@ -582,7 +526,15 @@ process_received_frame
 
 void 
 initialize()
-{}
+{
+  for (auto &i : g_interfaces)
+  {
+    invalidate_descriptors(i.tx_buffer_descriptors);
+    invalidate_descriptors(i.rx_buffer_descriptors);
+    reset_descriptor_ranges(i.tx_payload_buffer, i.tx_buffer_descriptors);  
+    reset_descriptor_ranges(i.rx_payload_buffer, i.rx_buffer_descriptors);  
+  }
+}
 
 bool
 set
@@ -626,7 +578,7 @@ bind
       haluj::bounded::push_back
         (
           g_udp_ports, 
-          port_descriptor{id, port}
+          port_descriptor(g_interfaces[id], port)
         );
     
     if (e)
@@ -648,23 +600,15 @@ received_length
   
   if (ed && *ed < g_udp_ports.size() )
   {
-    auto &p = g_udp_ports[*ed];
+    auto &p       = g_udp_ports[*ed];
+    interface &i  = *p.intf_ref;
+      
+    TRACE( __FUNCTION__ << " p.rx_buffer_descriptor_refs.size() " << p.rx_buffer_descriptor_refs.size() << " \n" );
     
-    if (p.ifd < g_interfaces.size())
+    if (!p.rx_buffer_descriptor_refs.empty())
     {
-      interface &i = g_interfaces[p.ifd];
-      
-      TRACE( __FUNCTION__ << " i.rx_buffer_descriptor.size() " << i.rx_buffer_descriptors.size() << " \n" );
-      
-      if (!i.rx_buffer_descriptors.empty())
-      {
-        auto &bd = i.rx_buffer_descriptors.front();
-        result = bd.size;
-      }
-    }
-    else
-    {
-      TRACE("Endpoint invalid");
+      buffer_descriptor &bd = *p.rx_buffer_descriptor_refs.front();
+      result = bd.size;
     }
   }
   
@@ -684,43 +628,42 @@ receive
   
   if (ed && *ed < g_udp_ports.size() )
   {
-    auto &p   = g_udp_ports[*ed];
+    auto &p       = g_udp_ports[*ed];
+    interface &i  = *p.intf_ref;
     
-    if (p.ifd < g_interfaces.size())
+    if ( !p.rx_buffer_descriptor_refs.empty() )
     {
-      interface &i = g_interfaces[p.ifd];
+      buffer_descriptor &bd = *p.rx_buffer_descriptor_refs.front();
+      p.rx_buffer_descriptor_refs.pop();
       
-      if ( !i.rx_buffer_descriptors.empty() )
+      auto &f = bd.flags;
+      
+      if (f.test<valid>())
       {
-        auto &bd  = i.rx_buffer_descriptors.front();
-
+        f.clear<valid>();
+        
         auto read_size = std::min(size, bd.size);
 
-        copy_from_payload_buffer
-        (
-          data, 
-          i.rx_payload_buffer, 
-          read_size, 
-          bd.first
-        );
+        std::memcpy(data, bd.first, read_size);
         
         remote = bd.remote;
-
-        i.rx_buffer_descriptors.pop();
-
         result = read_size;
       }
     }
     else
     {
-      TRACE("Endpoint invalid");
+      TRACE("Nothing to receive\n");
     }
+  }
+  else
+  {
+    TRACE("Endpoint invalid");
   }
   
   return result;
 }
 
-void
+std::size_t
 send
 (
   const endpoint_designator&  ed,
@@ -729,43 +672,42 @@ send
   const endpoint&             remote
 )
 {
-  if (ed)
+  std::size_t result = 0U;
+  
+  if (ed && *ed < g_udp_ports.size() )
   {
-    // get port descriptor
-    auto &p   = g_udp_ports[*ed];
-    
-    if (p.ifd < g_interfaces.size())
-    {
-      interface &i = g_interfaces[p.ifd];
-      
-      auto first = (i.tx_buffer_descriptors.size() > 0) ? i.tx_buffer_descriptors.back().last : 0;
-      auto last  = copy_to_payload_buffer(i.tx_payload_buffer, data, size, first);
+    auto      &p = g_udp_ports[*ed];
+    interface &i = *p.intf_ref;
 
-      if (!i.tx_buffer_descriptors.full())
-      {
-        i.tx_buffer_descriptors.push
-        (
-          buffer_descriptor
-          {
-            first, 
-            last,
-            size,
-            remote,
-            p.port,
-            protocol::ipv4::PROTOCOL_UDP
-          }
-        );      
-      } 
-      else
-      {
-        TRACE("ERROR! Transmit overflow\n");
-      }
+    auto bd_ref = 
+      allocate_bd
+      (
+        i.tx_payload_buffer, 
+        i.tx_buffer_descriptors, 
+        size
+      );
+    
+    if (bd_ref)
+    {
+      buffer_descriptor &bd = *bd_ref;
+      
+      std::memcpy(bd.first, data, size);
+      
+      TRACE(__FUNCTION__ << "-> tx payload:" << std::string(bd.first, bd.last) << "\n" );
+      
+      bd.port         = p.port;
+      bd.remote       = remote;
+      bd.ip_protocol  = UDP;
+      
+      result = size;     
+    }
+    else
+    {
+      TRACE("ERROR! Cannot allocate transmit buffer descriptor\n");
     }
   }
-  else
-  {
-    TRACE("Endpoint invalid\n");
-  }
+  
+  return result;
 }
 
 } // namespace udp
