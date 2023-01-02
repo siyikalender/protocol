@@ -42,6 +42,11 @@ namespace ipv4
 {
 
 typedef std::array<uint8_t, 4> address;
+
+inline uint32_t to_u32(const protocol::ipv4::address& a)
+{
+  return *reinterpret_cast<const uint32_t*>(&a[0]);
+}
   
 } // namespace ipv4
 
