@@ -59,8 +59,16 @@ uint16_t calculate_checksum(uint16_t *ptr, unsigned size)
   {
     sum += *ptr;
   }
+  
+  if ((size & 0x01) == 0x01)
+  {
+    sum += uint16_t( *reinterpret_cast<const uint8_t*>(ptr) );
+  }
 
-  sum = (sum >> 16) + (sum & 0xFFFF);
+  while(sum >> 16)
+  {
+    sum = (sum >> 16) + (sum & 0xFFFF); 
+  }
 
   return ~sum;
 }
@@ -94,7 +102,13 @@ write_arp_packet
   arp->target_hw_addr     = e.hw_addr;
   arp->target_ip_addr     = e.ip_addr;
   
-  TRACE("My HW Addr : " << i.hw_addr << "\n");
+  TRACE(__FUNCTION__ << "\n");
+  
+  TRACE(((is_response) ? "Reply\n" : "Request\n"));
+  TRACE("Sender HW Addr : " << i.hw_addr << "\n");
+  TRACE("Sender IP Addr : " << i.ip_addr << "\n");
+  TRACE("Target HW Addr : " << e.hw_addr << "\n");
+  TRACE("Target IP Addr : " << e.ip_addr << "\n");
 }
 
 void 
@@ -143,8 +157,11 @@ write_icmp_echo_packet
   icmp->sequence_number     = in_icmp_ptr->sequence_number;
 
   std::memcpy(echo, ctxt.ptr, echo_size);
-
+  
   icmp->checksum            = calculate_checksum( (uint16_t *) icmp, sizeof(icmp_packet) + echo_size);
+
+  TRACE("IP Checksum :"   <<  std::hex << ip->checksum << std::dec << ", size:20\n");  
+  TRACE("ICMP Checksum :" <<  std::hex << icmp->checksum  << std::dec << ", size:" << sizeof(icmp_packet) + echo_size << "\n");  
 }
 
 arp_table_entry_ref
@@ -324,6 +341,16 @@ process_icmp_packet
 
   if (icmp_ptr->type == 0x08)
   {
+    uint16_t  in_ip_chk   = ip_ptr->checksum;
+    ip_ptr->checksum    = 0;
+    uint16_t  ip_chk      = calculate_checksum( (uint16_t *) ip_ptr, 20);
+
+    uint16_t  in_icmp_chk = icmp_ptr->checksum;
+    icmp_ptr->checksum  = 0;
+    uint16_t  icmp_chk    = calculate_checksum( (uint16_t *) icmp_ptr, std::distance(ctxt.ptr, ctxt.last) + sizeof(icmp_packet));
+//
+    TRACE("IP Checksum   :" << std::hex << in_ip_chk    << " ? " << ip_chk   << "\n");  
+    TRACE("ICMP Checksum :" << std::hex << in_icmp_chk  << " ? " << icmp_chk << "\n");  
     write_icmp_echo_packet( i, ctxt, ip_ptr, icmp_ptr );
   }
 }
@@ -471,8 +498,6 @@ process_received_frame
   TRACE(__FUNCTION__ << "\n");
 
   TRACE("RX length:" << i.rx_frame_size << "\n");
-
-  i.tx_frame_size = 0;
 
   ctxt.ptr              = i.rx_frame_buffer.begin();
   ctxt.last             = i.rx_frame_buffer.begin() + i.rx_frame_size;
