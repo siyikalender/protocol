@@ -27,6 +27,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org>
 */
 /// \author Selcuk Iyikalender
+/// \author Claude Opus 5.5 <noreply@anthropic.com>
 /// \date   2022
 
 #ifndef PROTOCOL_IPV4_ADDRESS_HPP
