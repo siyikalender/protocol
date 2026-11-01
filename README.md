@@ -59,9 +59,11 @@ ipv4::step_dma
   frame, so the ring never runs empty.
 - Transmit: the driver owns the block until the frame is sent, then
   `reclaim` hands it back. A refused frame is sent again at the next step.
-- The frame starts `c_packet_headroom` bytes into `dma::storage(id)`. Use
-  `storage()` with a MAC that inserts those bytes itself (Kinetis ENET
-  SHIFT16, headroom 2), `dma::receive_buffer()` otherwise (headroom 0).
+- The frame starts `c_packet_headroom` bytes into `dma::storage(id)`;
+  `dma::receive_buffer()` is that address. DMA drivers build with
+  `PROTOCOL_IPV4_PACKET_HEADROOM=0`, so frames start on the block's aligned
+  address (the stack reads headers byte by byte, alignment does not matter
+  to it).
 - `dma::id_of(address)` maps a buffer address from a HAL callback back to
   its block.
 - Size the pool for the rings:
@@ -71,6 +73,29 @@ ipv4::step_dma
   with `.eth_ram` NOLOAD in the linker script, or clean / invalidate the
   blocks around DMA. `initialize()` resets the pool, the section needs no
   zeroing at start up.
+
+Example drivers, built against the vendors' current releases:
+
+| Folder | MCU | Vendor driver |
+| --- | --- | --- |
+| `examples/drivers/stm32f7` | STM32F7 | STM32Cube ETH HAL (`HAL_ETH_ReadData`, `HAL_ETH_RxAllocateCallback`), not the legacy one |
+| `examples/drivers/kinetis` | Kinetis K60/K64/K66 | MCUXpresso SDK `fsl_enet` (`ENET_GetRxFrame`, `ENET_StartTxFrame`) |
+
+Each header shows the start up order and the `step_dma()` call.
+
+### Settings
+
+`constants.hpp` holds the defaults. These can be changed per target with
+compile definitions, seen by the library and the application alike
+(e.g. `target_compile_definitions(protocol_ipv4 PUBLIC ...)`):
+
+| Definition | Default |
+| --- | --- |
+| `PROTOCOL_IPV4_PACKET_POOL_SIZE` | 6 |
+| `PROTOCOL_IPV4_PACKET_HEADROOM` | 2 (0 for DMA drivers) |
+| `PROTOCOL_IPV4_PACKET_BLOCK_ALIGNMENT` | 32 |
+| `PROTOCOL_IPV4_VERIFY_RX_CHECKSUMS` | 1 (0 with MAC checksum offload) |
+| `PROTOCOL_IPV4_PACKET_POOL_ATTRIBUTES` | empty (e.g. a section attribute) |
 
 ## Building and testing
 
