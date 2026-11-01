@@ -41,6 +41,7 @@ For more information, please refer to <http://unlicense.org>
 #ifndef PROTOCOL_IPV4_GRAMMAR_HPP
 #define PROTOCOL_IPV4_GRAMMAR_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <iterator>
 
@@ -59,10 +60,12 @@ namespace ipv4
 namespace grammar
 {
 
-/// A field of n bytes
-constexpr auto bytes(int n)
+/// A field of N bytes. Of fixed width: a sequence of such fields is checked
+/// for length once.
+template<std::size_t N>
+constexpr auto bytes()
 {
-  return haluj::nt(n, haluj::anychar());
+  return haluj::field<N>();
 }
 
 /// Runs rule over the range; on a match out becomes value
@@ -103,11 +106,11 @@ constexpr bool parse_arp(const Range& packet, arp_packet& out)
       be16(wire::eth::type_ipv4),                     // ar$pro  protocol address space: IPv4
       u8(6),                                          // ar$hln  hardware address length
       u8(4),                                          // ar$pln  protocol address length
-      action(bytes(2), store_be(p.opcode)),           // ar$op   REQUEST or REPLY
-      action(bytes(6), store_bytes(p.sender_hw)),     // ar$sha
-      action(bytes(4), store_bytes(p.sender_ip)),     // ar$spa
-      bytes(6),                                       // ar$tha  not needed
-      action(bytes(4), store_bytes(p.target_ip))      // ar$tpa
+      action(bytes<2>(), store_be(p.opcode)),           // ar$op   REQUEST or REPLY
+      action(bytes<6>(), store_bytes(p.sender_hw)),     // ar$sha
+      action(bytes<4>(), store_bytes(p.sender_ip)),     // ar$spa
+      bytes<6>(),                                       // ar$tha  not needed
+      action(bytes<4>(), store_bytes(p.target_ip))      // ar$tpa
     );
 
   return parse(rule, packet, p, out);
@@ -146,21 +149,23 @@ constexpr bool parse_ipv4_header(const Range& packet, ipv4_header& out)
     options   = static_cast<int>(h.ihl) * 4 - static_cast<int>(wire::ip::min_size);
   };
 
-  const auto rule =
+  // The fixed part: one length check for all its fields
+  const auto fixed_part =
     seq
     (
-      action(bytes(1), version_ihl),                    // Version, IHL
-      bytes(1),                                         // Type of Service
-      action(bytes(2), store_be(h.total_length)),       // Total Length
-      bytes(2),                                         // Identification
-      action(bytes(2), store_be(h.flags_fragment)),     // Flags, Fragment Offset
-      bytes(1),                                         // Time to Live
-      action(bytes(1), store_be(h.protocol)),           // Protocol
-      bytes(2),                                         // Header Checksum
-      action(bytes(4), store_bytes(h.source)),          // Source Address
-      action(bytes(4), store_bytes(h.destination)),     // Destination Address
-      vt(options, anychar())                            // Options (none when IHL <= 5)
+      action(bytes<1>(), version_ihl),                    // Version, IHL
+      bytes<1>(),                                         // Type of Service
+      action(bytes<2>(), store_be(h.total_length)),       // Total Length
+      bytes<2>(),                                         // Identification
+      action(bytes<2>(), store_be(h.flags_fragment)),     // Flags, Fragment Offset
+      bytes<1>(),                                         // Time to Live
+      action(bytes<1>(), store_be(h.protocol)),           // Protocol
+      bytes<2>(),                                         // Header Checksum
+      action(bytes<4>(), store_bytes(h.source)),          // Source Address
+      action(bytes<4>(), store_bytes(h.destination))      // Destination Address
     );
+
+  const auto rule = seq(fixed_part, vt(options, anychar()));   // Options (none when IHL <= 5)
 
   return parse(rule, packet, h, out);
 }
@@ -185,10 +190,10 @@ constexpr bool parse_udp_header(const Range& datagram, udp_header& out)
   const auto rule =
     seq
     (
-      action(bytes(2), store_be(u.source_port)),        // Source Port
-      action(bytes(2), store_be(u.destination_port)),   // Destination Port
-      action(bytes(2), store_be(u.length)),             // Length
-      action(bytes(2), store_be(u.checksum))            // Checksum
+      action(bytes<2>(), store_be(u.source_port)),        // Source Port
+      action(bytes<2>(), store_be(u.destination_port)),   // Destination Port
+      action(bytes<2>(), store_be(u.length)),             // Length
+      action(bytes<2>(), store_be(u.checksum))            // Checksum
     );
 
   return parse(rule, datagram, u, out);
@@ -208,9 +213,9 @@ constexpr bool parse_icmp_echo_request(const Range& message)
     (
       u8(wire::icmp::echo_request),   // Type
       u8(0),                          // Code
-      bytes(2),                       // Checksum
-      bytes(2),                       // Identifier
-      bytes(2)                        // Sequence Number
+      bytes<2>(),                       // Checksum
+      bytes<2>(),                       // Identifier
+      bytes<2>()                        // Sequence Number
     );
 
   auto first = std::begin(message);
