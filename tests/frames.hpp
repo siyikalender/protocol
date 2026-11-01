@@ -123,6 +123,7 @@ struct ip_options
   bool                         bad_checksum = false;
   std::uint8_t                 tos          = 0;
   protocol::ipv4::address      dest         = stack_ip;
+  std::uint8_t                 option_words = 0;   ///< IP options, 4 bytes each (NOPs)
 };
 
 /// IPv4 frame from host h with the given transport header + payload,
@@ -130,18 +131,20 @@ struct ip_options
 inline bytes ipv4_frame(std::uint8_t h, std::uint8_t proto, const bytes& l4data,
                         ip_options o = {})
 {
-  bytes f(std::max<std::size_t>(60, 34 + l4data.size()), 0);
+  const std::size_t hl = 20 + 4U * o.option_words;
+  bytes f(std::max<std::size_t>(60, 14 + hl + l4data.size()), 0);
   put(f, 0, stack_mac);
   put(f, 6, host_mac(h));
   put16(f, 12, 0x0800);
-  f[14] = 0x45; f[15] = o.tos;
-  put16(f, 16, o.total_length.value_or(std::uint16_t(20 + l4data.size())));
+  f[14] = std::uint8_t(0x40 | (hl / 4)); f[15] = o.tos;
+  put16(f, 16, o.total_length.value_or(std::uint16_t(hl + l4data.size())));
   put16(f, 18, 0x1234); put16(f, 20, 0x4000);  // DF
   f[22] = 64; f[23] = proto;
   put(f, 26, host_ip(h)); put(f, 30, o.dest);
-  std::uint16_t c = fold(sum16(&f[ip], 20));
+  std::fill(f.begin() + 34, f.begin() + 14 + std::ptrdiff_t(hl), std::uint8_t(1));  // NOP
+  std::uint16_t c = fold(sum16(&f[ip], hl));
   put16(f, 24, o.bad_checksum ? std::uint16_t(c ^ 0x5555) : c);
-  std::copy(l4data.begin(), l4data.end(), f.begin() + 34);
+  std::copy(l4data.begin(), l4data.end(), f.begin() + 14 + std::ptrdiff_t(hl));
   return f;
 }
 

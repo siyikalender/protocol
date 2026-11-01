@@ -257,6 +257,42 @@ void dma_zero_copy_echo()
   PROTOCOL_CHECK(no_leak());
 }
 
+/// A datagram that came with IP options goes back out with its frame on the
+/// block's aligned start, as DMAs want it
+void dma_echo_with_ip_options()
+{
+  setup();
+  auto ed = ipv4::udp::bind(0, 7);
+  exchange({frames::arp_request(10)});
+  g_mac.wire.clear();
+
+  bytes data = frames::pattern(64, 9);
+  frames::ip_options o;
+  o.option_words = 3;
+  g_mac.arrive(frames::udp_frame(10, 5555, 7, data, o));
+  run_step();
+
+  auto d = ipv4::udp::receive(ed);
+  PROTOCOL_CHECK(d.has_value() && d->size() == 64);
+  if (!d) return;
+  PROTOCOL_CHECK(d->remote == (ipv4::endpoint{frames::host_ip(10), 5555}));
+
+  const auto block = *d->buffer.id();
+  ipv4::udp::send(ed, std::move(d->buffer), d->remote);
+  run_step();
+  PROTOCOL_CHECK(g_mac.tx_ring.size() == 1);
+  if (g_mac.tx_ring.size() != 1) return;
+  PROTOCOL_CHECK(g_mac.tx_ring.front().id == block);
+  PROTOCOL_CHECK(g_mac.tx_ring.front().frame.data() ==
+                 ipv4::dma::storage(block).data() + ipv4::c_packet_headroom);
+
+  g_mac.send_out();
+  run_step();
+  PROTOCOL_CHECK(g_mac.wire.size() == 1 && frames::udp_valid(g_mac.wire[0]));
+  PROTOCOL_CHECK(g_mac.wire.size() == 1 && frames::udp_payload(g_mac.wire[0]) == data);
+  PROTOCOL_CHECK(no_leak());
+}
+
 /// A full TX ring loses nothing: the frames wait and go out in order, once
 void dma_tx_ring_full()
 {
@@ -277,8 +313,8 @@ void dma_tx_ring_full()
     if (ipv4::udp::send(ed, m.data(), m.size(), {frames::host_ip(10), 9}) == 8)
       ++sent;
   }
-  PROTOCOL_CHECK(sent == room);
-  PROTOCOL_CHECK(ipv4::stats().tx_no_buffer == 4 - room);
+  PROTOCOL_CHECK(sent == std::min<std::size_t>(4, room));
+  PROTOCOL_CHECK(ipv4::stats().tx_no_buffer == 4U - sent);
 
   for (int k = 0; k < 3; ++k)
     run_step();                               // the MAC sends nothing yet
@@ -394,6 +430,7 @@ const test_case g_cases[] =
 {
   {"dma_arp_and_ping",            dma_arp_and_ping},
   {"dma_zero_copy_echo",          dma_zero_copy_echo},
+  {"dma_echo_with_ip_options",    dma_echo_with_ip_options},
   {"dma_tx_ring_full",            dma_tx_ring_full},
   {"dma_replies_while_tx_stuck",  dma_replies_while_tx_stuck},
   {"dma_overload_cut_at_ring",    dma_overload_cut_at_ring},

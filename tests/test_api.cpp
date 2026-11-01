@@ -155,13 +155,16 @@ void allocate_and_drop()
 void reserves_keep_both_directions_alive()
 {
   setup();
-  ipv4::endpoint_designator ports[4];
-  for (std::uint16_t i = 0; i < 4; ++i)
+  // Every port the table holds: their queues together outgrow the pool
+  constexpr std::size_t n = ipv4::c_udp_ports_table_size;
+  static_assert(n * ipv4::c_udp_rx_queue_depth > ipv4::c_packet_pool_size);
+  ipv4::endpoint_designator ports[n];
+  for (std::uint16_t i = 0; i < n; ++i)
     ports[i] = ipv4::udp::bind(0, std::uint16_t(1000 + i));
   deliver({frames::arp_request(10)});
 
-  for (int k = 0; k < 3; ++k)
-    for (std::uint16_t i = 0; i < 4; ++i)
+  for (std::size_t k = 0; k < ipv4::c_udp_rx_queue_depth + 1; ++k)
+    for (std::uint16_t i = 0; i < n; ++i)
       deliver({frames::udp_frame(10, 1, std::uint16_t(1000 + i), frames::pattern(50))}, 0);
 
   PROTOCOL_CHECK(ipv4::g_packet_pool.available() == ipv4::c_tx_reserved_blocks + 1);

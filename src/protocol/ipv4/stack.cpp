@@ -206,6 +206,19 @@ void write_udp_frame(const interface& itf, const tx_entry& t, const ethernet::ad
   const packet_id   p           = t.id;
   const std::size_t udp_length  = wire::udp::size + g_packet_pool.data(p).size();
 
+  // Every frame starts at the headroom, where a DMA wants its alignment. A
+  // datagram sent back in its received block normally already does; one
+  // that came with IP options is moved there (the only copy, and rare).
+  constexpr std::size_t payload_offset =
+    c_packet_headroom + eth::size + ip::min_size + wire::udp::size;
+
+  if (front_room(p) != payload_offset)
+  {
+    const auto payload = g_packet_pool.data(p);
+    std::memmove(g_packet_pool.base(p) + payload_offset, payload.data(), payload.size());
+    g_packet_pool.set(p, payload_offset, payload.size());
+  }
+
   std::uint8_t* u = g_packet_pool.push_header(p, wire::udp::size);
   store16(u + wire::udp::source_port,      t.source_port);
   store16(u + wire::udp::destination_port, t.remote.port);

@@ -47,6 +47,7 @@ protocol_cases(protocol_test_api test_api.cpp
 protocol_cases(protocol_test_dma test_dma.cpp
   dma_arp_and_ping
   dma_zero_copy_echo
+  dma_echo_with_ip_options
   dma_tx_ring_full
   dma_replies_while_tx_stuck
   dma_overload_cut_at_ring

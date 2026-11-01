@@ -52,15 +52,39 @@ constexpr std::size_t c_interface_table_size    = 1;
 constexpr std::size_t c_arp_table_size          = 4;
 constexpr std::size_t c_udp_ports_table_size    = 8;
 
+// The settings below can be changed per target without editing this file,
+// with a compile definition seen by the library and the application alike
+// (e.g. target_compile_definitions(protocol_ipv4 PUBLIC ...) in CMake).
+
+#ifndef PROTOCOL_IPV4_PACKET_POOL_SIZE
+#define PROTOCOL_IPV4_PACKET_POOL_SIZE        6
+#endif
+
+#ifndef PROTOCOL_IPV4_PACKET_BLOCK_ALIGNMENT
+#define PROTOCOL_IPV4_PACKET_BLOCK_ALIGNMENT  32
+#endif
+
+#ifndef PROTOCOL_IPV4_PACKET_HEADROOM
+#define PROTOCOL_IPV4_PACKET_HEADROOM         2
+#endif
+
+#ifndef PROTOCOL_IPV4_VERIFY_RX_CHECKSUMS
+#define PROTOCOL_IPV4_VERIFY_RX_CHECKSUMS     1
+#endif
+
 /// Packet pool: every frame, received or sent, lives in one block of the
 /// pool. Memory = c_packet_pool_size * c_packet_block_size (+4 bytes each).
-constexpr std::size_t c_packet_pool_size        = 6;
+/// With step_dma() the RX ring holds blocks too: see stack.hpp.
+constexpr std::size_t c_packet_pool_size        = PROTOCOL_IPV4_PACKET_POOL_SIZE;
 /// A multiple of 32 (Cortex-M7 cache line) and of 16 (Kinetis ENET receive
 /// buffer size rule), large enough for the headroom plus a full frame
 constexpr std::size_t c_packet_block_size       = 1536;
-constexpr std::size_t c_packet_block_alignment  = 32;
-/// Puts the IP header on a 4 byte boundary
-constexpr std::size_t c_packet_headroom         = 2;
+constexpr std::size_t c_packet_block_alignment  = PROTOCOL_IPV4_PACKET_BLOCK_ALIGNMENT;
+/// Bytes before the frame in a block. 2 puts the IP header on a 4 byte
+/// boundary, which only matters for the application's payload: the stack
+/// reads headers byte by byte. DMA drivers use 0, so frames start on the
+/// block's aligned address (Kinetis ENET and STM32F7 ETH alike).
+constexpr std::size_t c_packet_headroom         = PROTOCOL_IPV4_PACKET_HEADROOM;
 
 /// Reserves between the two directions:
 ///   - a received datagram is queued on its port only when one block for
@@ -91,7 +115,7 @@ constexpr std::uint8_t  c_arp_max_requests      = 3;
 /// Checks the IP, ICMP and UDP checksums of received packets in software.
 /// Set to false when the MAC checks them and drops bad frames itself
 /// (checksum offload), so the work is not done twice.
-constexpr bool          c_verify_rx_checksums   = true;
+constexpr bool          c_verify_rx_checksums   = PROTOCOL_IPV4_VERIFY_RX_CHECKSUMS != 0;
 
 static_assert(c_packet_block_size >= c_packet_headroom + c_max_eth_frame_size);
 static_assert(c_packet_pool_size > c_tx_reserved_blocks + c_rx_reserved_blocks);
