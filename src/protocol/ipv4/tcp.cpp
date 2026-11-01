@@ -192,6 +192,8 @@ struct tcb
   std::uint32_t         rtt_start   = 0;
   std::uint8_t          dupacks     = 0;
   bool                  in_recovery = false;          ///< RFC 6582: until recover is acknowledged
+  bool                  probe_sent  = false;          ///< RFC 8985: a tail loss probe waits for its ACK
+  std::uint32_t         last_send   = 0;              ///< when data went last
   std::uint32_t         recover     = 0;
   bool                  probe_now   = false;
 
@@ -701,6 +703,7 @@ void acknowledge(tcb& c, std::uint32_t ack)
   }
 
   c.snd_una     = ack;
+  c.probe_sent  = false;
   c.retransmits = 0;
   c.dupacks     = 0;
   c.rto         = c.rtt_valid ? c.rto : c_tcp_rto_initial;
@@ -1318,6 +1321,40 @@ void run_timers(tcb& c)
     return;
   }
 
+  // Tail loss probe (RFC 8985 7): before the timeout, the last segment
+  // again, so the peer's ACK (with SACK) shows what is missing at the end.
+  // In recovery the first hole goes again instead: with few segments out,
+  // a lost retransmission leaves nothing that could bring an ACK (RFC 8985
+  // keeps probes out of recovery; a duplicate costs one segment, a timeout
+  // costs at least c_tcp_rto_min). With SACK only, once per new ACK.
+  if (!persist && c.sack_ok && c.rtt_valid && !c.probe_sent && c.synchronized())
+  {
+    const auto sent = std::count_if(c.tx.begin(), c.tx.end(), [](const tx_segment& s)
+                                    { return s.flags.test<seg_sent>() && s.length > 0; });
+    std::uint32_t pto = std::max(2 * c.srtt, c_tcp_pto_min);
+    if (sent == 1)
+      pto += c_tcp_delayed_ack_max;
+
+    if (sent > 0 && pto < c.rto && g_now - c.last_send >= pto)
+    {
+      for (std::size_t k = 0; k < c.tx.size(); ++k)
+      {
+        tx_segment& s = c.tx[c.in_recovery ? k : c.tx.size() - 1 - k];
+        if (s.flags.test<seg_sent>() && !s.flags.test<seg_sacked>() && s.length > 0)
+        {
+          s.flags.clear<seg_sent>().set<seg_retransmitted>();
+          c.rtt_timing = false;
+          ++g_stats.tcp_retransmits;
+          ++g_stats.tcp_loss_probes;
+          break;
+        }
+      }
+      c.probe_sent  = true;
+      c.timer_start = g_now;      // the timeout counts from the probe
+      return;
+    }
+  }
+
   if (g_now - c.timer_start < c.rto)
     return;
 
@@ -1406,6 +1443,7 @@ std::optional<packet_id> next_segment(tcb& c)
     g_packet_pool.set(s.id, s.offset, s.length);
     write_segment(c, s.id, s.seq, control, s.flags.test<seg_syn>());
     s.flags.set<seg_sent>();
+    c.last_send = g_now;
 
     if (is_new)
     {
@@ -1856,6 +1894,41 @@ bool can_send(const tcb& c)
   return (c.state == tcp_state::established || c.state == tcp_state::close_wait) && !c.fin_wanted;
 }
 
+/// Blocks data to send leaves free: the next received frame and, while a
+/// connection has an open receive window and no block for the next segment
+/// in order to land in, one block for it (blocks kept out of order are
+/// given up for it anyway). The windows may promise more; keeping more here
+/// (one per connection, or per segment) starves sending in a small pool,
+/// and a segment refused comes again soon (SACK, fast retransmit).
+std::size_t send_keep()
+{
+  bool promised = false;
+  for (const tcb& c : g_tcb)
+  {
+    if (!(c.state == tcp_state::established || c.state == tcp_state::fin_wait_1 ||
+          c.state == tcp_state::fin_wait_2) || c.discards() || !c.ooo.empty() ||
+        !seq_gt(c.rcv_adv, c.rcv_nxt))
+      continue;
+
+    std::uint32_t window = c.rcv_adv - c.rcv_nxt;
+    if (!c.rx.empty())
+    {
+      const auto        t   = g_packet_pool.data(c.rx.back());
+      const std::size_t end = static_cast<std::size_t>(t.data() - g_packet_pool.base(c.rx.back())) + t.size();
+      const std::size_t tail = c_packet_block_size - end;
+      window = window > tail ? static_cast<std::uint32_t>(window - tail) : 0;
+    }
+    if (window > 0)
+    {
+      promised = true;
+      break;
+    }
+  }
+  // Keeping a received block leaves the transmit reserve and the next
+  // frame (store_data()): with a promise, the transmit reserve stays too
+  return c_rx_reserved_blocks + (promised ? c_tx_reserved_blocks + 1 : 0);
+}
+
 /// Room at the end of the last segment not sent yet
 std::size_t tail_room(const tcb& c)
 {
@@ -1886,8 +1959,8 @@ std::size_t send_space(connection h)
   if (c == nullptr || !can_send(*c))
     return 0;
 
-  const std::size_t blocks_free = g_packet_pool.available() > c_rx_reserved_blocks
-                                    ? g_packet_pool.available() - c_rx_reserved_blocks : 0;
+  const std::size_t keep        = send_keep();
+  const std::size_t blocks_free = g_packet_pool.available() > keep ? g_packet_pool.available() - keep : 0;
   const std::size_t slots = std::min(c->tx.capacity() - c->tx.size(), blocks_free);
   return tail_room(*c) + slots * c->mss();
 }
@@ -1912,7 +1985,7 @@ std::size_t send(connection h, const std::uint8_t* data, std::size_t size)
 
   while (done < size && !c->tx.full())
   {
-    auto p = g_packet_pool.acquire(c_rx_reserved_blocks);
+    auto p = g_packet_pool.acquire(send_keep());
     if (!p)
     {
       ++g_stats.tx_no_buffer;
@@ -1934,7 +2007,7 @@ std::optional<packet> allocate(connection h, std::size_t size)
   if (c == nullptr || size > c->mss())
     return std::nullopt;
 
-  auto p = g_packet_pool.acquire(c_rx_reserved_blocks);
+  auto p = g_packet_pool.acquire(send_keep());
   if (!p)
   {
     ++g_stats.tx_no_buffer;

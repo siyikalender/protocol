@@ -81,10 +81,17 @@ for (;;)
   without data.
 - Sent segments stay in their pool blocks until acknowledged and are sent
   again from there: no send buffer, no copy.
-- Not done: congestion control (RFC 5681), window scaling, timestamps,
-  tail loss probes (a loss among the last segments waits for the
-  retransmission timer). Data segments carry no SACK blocks, only ACKs
-  without data do.
+- Tail loss probe (RFC 8985) with SACK: when ACKs stop, the last segment
+  goes again after twice the smoothed RTT (at least
+  `c_tcp_pto_min`), long before the timeout. In recovery the first hole
+  goes instead, so a lost retransmission does not wait for the timeout
+  either (RFC 8985 keeps probes out of recovery; with few segments out
+  nothing else would bring an ACK).
+- Sending leaves a block free for the next segment in order while a
+  receive window is open, so data in order is not dropped for lack of a
+  block.
+- Not done: congestion control (RFC 5681), window scaling, timestamps.
+  Data segments carry no SACK blocks, only ACKs without data do.
 
 ### DMA drivers
 

@@ -158,6 +158,11 @@ constexpr std::uint32_t c_tcp_rto_initial       = 1000;
 constexpr std::uint32_t c_tcp_rto_min           = 200;
 constexpr std::uint32_t c_tcp_rto_max           = 60000;
 constexpr std::uint8_t  c_tcp_max_retransmits   = 8;
+/// Tail loss probe (RFC 8985 7): the probe timeout is twice the smoothed
+/// RTT, at least c_tcp_pto_min, plus the longest delayed ACK the peer may
+/// take when only one segment is out
+constexpr std::uint32_t c_tcp_pto_min           = 10;
+constexpr std::uint32_t c_tcp_delayed_ack_max   = 200;
 /// TIME-WAIT. RFC 9293 asks for 2 MSL (4 minutes); embedded stacks keep it
 /// short to reuse their few connections.
 constexpr std::uint32_t c_tcp_time_wait         = 2000;

@@ -427,6 +427,51 @@ void tcp_sack_sender()
   PROTOCOL_CHECK(ipv4::stats().tcp_retransmits == 1);
 }
 
+/// Tail loss probe (RFC 8985): the last segment goes again well before the
+/// retransmission timeout, once
+void tcp_tail_loss_probe()
+{
+  setup();
+  auto l = ipv4::tcp::listen(0, 80);
+  peer p;
+  auto c = *open_passive(*l, 80, p, true);
+
+  // RTT samples: the handshake, then 20 ms
+  const bytes first = frames::pattern(100, 1);
+  ipv4::tcp::send(c, first.data(), first.size());
+  run_step();
+  wait(20);
+  p.ack += 100;
+  deliver({p.segment(ACK)});
+
+  const bytes out = frames::pattern(2000, 2);          // 1460 and 540
+  ipv4::tcp::send(c, out.data(), out.size());
+  run_step(); run_step();
+  const std::uint32_t a = p.ack;
+  g_tx.clear();
+
+  std::uint32_t start = g_now, probe_at = 0;
+  for (int i = 0; i < 100 && probe_at == 0; ++i)
+  {
+    g_now += 1;
+    run_step();
+    if (!segments().empty())
+      probe_at = g_now - start;
+  }
+  auto s = segments();
+  PROTOCOL_CHECK(s.size() == 1 && s[0].seq == a + 1460 && s[0].data.size() == 540);
+  // 2 x SRTT, at least c_tcp_pto_min: well before the timeout
+  PROTOCOL_CHECK(probe_at >= ipv4::c_tcp_pto_min && probe_at < ipv4::c_tcp_rto_min);
+  PROTOCOL_CHECK(ipv4::stats().tcp_loss_probes == 1);
+
+  // Not again: then the timeout sends the first segment
+  g_tx.clear();
+  wait(ipv4::c_tcp_rto_initial);
+  s = segments();
+  PROTOCOL_CHECK(!s.empty() && s[0].seq == a && s[0].data.size() == 1460);
+  PROTOCOL_CHECK(ipv4::stats().tcp_loss_probes == 1);
+}
+
 void tcp_zero_window_probe()
 {
   setup();
@@ -835,6 +880,7 @@ const test_case g_cases[] =
   {"tcp_early_retransmit",           tcp_early_retransmit},
   {"tcp_sack_receiver",              tcp_sack_receiver},
   {"tcp_sack_sender",                tcp_sack_sender},
+  {"tcp_tail_loss_probe",            tcp_tail_loss_probe},
   {"tcp_out_of_order_reassembly",    tcp_out_of_order_reassembly},
   {"tcp_out_of_order_fin",           tcp_out_of_order_fin},
   {"tcp_out_of_order_eviction",      tcp_out_of_order_eviction},

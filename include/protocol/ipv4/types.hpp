@@ -143,6 +143,7 @@ struct statistics
   uint32_t tcp_rx_refused       = 0;  ///< TCP data dropped: no room
   uint32_t tcp_rx_out_of_order  = 0;  ///< TCP segments kept ahead of a gap
   uint32_t tcp_resets_sent      = 0;
+  uint32_t tcp_loss_probes      = 0;  ///< TCP tail loss probes sent (also counted as retransmits)
 };
 
 typedef std::array<interface, c_interface_table_size>                   interface_container;
