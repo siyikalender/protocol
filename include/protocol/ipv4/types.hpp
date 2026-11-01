@@ -136,6 +136,8 @@ struct statistics
   uint32_t tx_no_buffer         = 0;  ///< send()/allocate() found the pool empty
   uint32_t tx_queue_full        = 0;
   uint32_t tx_arp_timeout       = 0;  ///< dropped, the host never answered
+  uint32_t tx_busy              = 0;  ///< step_dma(): the driver refused a frame
+  uint32_t tx_reply_dropped     = 0;  ///< step_dma(): a reply found no room to wait
 };
 
 typedef std::array<interface, c_interface_table_size>                   interface_container;

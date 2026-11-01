@@ -77,6 +77,9 @@ static_assert(c_rx_reserved_blocks >= 1, "one block is always needed to read a f
 constexpr std::size_t c_udp_rx_queue_depth      = 2;
 /// Datagrams waiting to be sent (e.g. for an ARP reply)
 constexpr std::size_t c_tx_queue_size           = 4;
+/// step_dma(): finished frames the driver refused (TX ring full), sent first
+/// at the next step. ARP and ping replies beyond this are dropped.
+constexpr std::size_t c_tx_waiting_size         = 2;
 
 /// ARP: a request is repeated after this interval, in the unit of the clock
 /// given to step() (milliseconds suggested) or in calls of step() when step()

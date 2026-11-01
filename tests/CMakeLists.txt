@@ -44,6 +44,14 @@ protocol_cases(protocol_test_api test_api.cpp
   short_frames_padded
   no_leaks)
 
+protocol_cases(protocol_test_dma test_dma.cpp
+  dma_arp_and_ping
+  dma_zero_copy_echo
+  dma_tx_ring_full
+  dma_replies_while_tx_stuck
+  dma_overload_cut_at_ring
+  dma_arp_timeout)
+
 # The example runs as a test too, so it keeps compiling
 add_executable(protocol_example ${PROJECT_SOURCE_DIR}/examples/test/main.cpp)
 target_link_libraries(protocol_example PRIVATE protocol::ipv4)

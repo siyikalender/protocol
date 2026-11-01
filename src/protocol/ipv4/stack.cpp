@@ -42,6 +42,15 @@ namespace protocol
 namespace ipv4
 {
 
+/// Lets the pool go to a memory section of its own, e.g. one the MPU maps
+/// non cacheable for the Ethernet DMA (STM32F7):
+///   -DPROTOCOL_IPV4_PACKET_POOL_ATTRIBUTES='__attribute__((section(".eth_ram")))'
+/// The section need not be zeroed at start up: initialize() resets the pool.
+#ifndef PROTOCOL_IPV4_PACKET_POOL_ATTRIBUTES
+#define PROTOCOL_IPV4_PACKET_POOL_ATTRIBUTES
+#endif
+
+PROTOCOL_IPV4_PACKET_POOL_ATTRIBUTES
 constinit packet_pool_type    g_packet_pool{};
 interface_container           g_interfaces{};
 arp_table_type                g_arp_table;
@@ -53,6 +62,7 @@ namespace
 using namespace wire;
 
 tx_queue_type     g_tx_queue;
+haluj::ring_buffer<std::array<packet_id, c_tx_waiting_size>> g_tx_waiting;
 statistics        g_stats;
 std::uint16_t     g_ip_identification = 0;
 std::uint32_t     g_lru_clock         = 0;
@@ -626,6 +636,37 @@ void transmitted(packet_id p)
   g_packet_pool.release(p);
 }
 
+std::optional<packet_id> waiting_frame()
+{
+  if (g_tx_waiting.empty())
+    return std::nullopt;
+  return g_tx_waiting.front();
+}
+
+void pop_waiting_frame()
+{
+  g_tx_waiting.pop();
+}
+
+void keep_waiting_frame(packet_id p)
+{
+  if (!g_tx_waiting.try_push(p))
+  {
+    ++g_stats.tx_reply_dropped;
+    g_packet_pool.release(p);
+  }
+}
+
+void handed_over(packet_id)
+{
+  ++g_stats.tx_frames;
+}
+
+void refused(packet_id)
+{
+  ++g_stats.tx_busy;
+}
+
 } // namespace detail
 
 // ---- public functions -----------------------------------------------------------
@@ -637,6 +678,7 @@ initialize()
   g_arp_table.clear();
   g_udp_ports.clear();
   g_tx_queue.clear();
+  g_tx_waiting.clear();
   g_stats             = {};
   g_ip_identification = 0;
   g_lru_clock         = 0;
@@ -664,6 +706,19 @@ stats()
 {
   return g_stats;
 }
+
+namespace dma
+{
+
+std::optional<packet_id> acquire()
+{
+  auto p = g_packet_pool.acquire(c_tx_reserved_blocks);
+  if (!p)
+    ++g_stats.rx_no_buffer;
+  return p;
+}
+
+} // namespace dma
 
 namespace udp
 {

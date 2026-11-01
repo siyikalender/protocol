@@ -110,6 +110,15 @@ namespace detail
   /// The block was written to the driver: counts and frees it
   void                      transmitted(packet_id p);
 
+  // step_dma(): frames the driver could not take yet, sent first next time
+  std::optional<packet_id>  waiting_frame();
+  void                      pop_waiting_frame();
+  /// Keeps the frame for later; drops it (frees the block) when full
+  void                      keep_waiting_frame(packet_id p);
+  /// The driver took the block (it frees it after sending)
+  void                      handed_over(packet_id p);
+  void                      refused(packet_id p);
+
   inline void release(packet_id p)                     { g_packet_pool.release(p); }
   inline std::span<std::uint8_t> data(packet_id p)     { return g_packet_pool.data(p); }
 } // namespace detail
@@ -173,6 +182,196 @@ step
 
     while (auto frame = detail::next_transmit_frame(id, tick))
       transmit(*frame);
+  }
+}
+
+// ---- DMA driver interface ---------------------------------------------------
+//
+// With a MAC whose DMA descriptors point to buffers, the blocks of the packet
+// pool are lent to the descriptors, so no frame is copied at all:
+//
+//   receive:  every RX descriptor always holds a block. When a frame has
+//             arrived the driver swaps it for a fresh block from
+//             dma::acquire() and gives the filled one to the stack. When
+//             dma::acquire() has none, the driver re-arms the descriptor with
+//             the same block and drops the frame: the ring never runs empty
+//             and overload is cut at the ring, never deeper in the stack.
+//   transmit: the stack gives a frame to the driver, which owns the block
+//             until the MAC has sent it, then hands it back through reclaim.
+//             When the TX ring is full the driver refuses, and the stack
+//             keeps the frame and tries again at the next step.
+//
+// The pool must hold the RX ring, the frames being sent, the datagrams
+// waiting on ports and the reserves:
+//   c_packet_pool_size >= RX descriptors + TX descriptors
+//                         + datagrams expected on ports + c_tx_reserved_blocks
+//
+// Call initialize() before the descriptors are armed: it frees every block.
+
+/// A frame the DMA has received into a block: it starts c_packet_headroom
+/// bytes after dma::storage(id).data(), size is without the FCS.
+struct rx_frame
+{
+  packet_id     id{};
+  std::size_t   size = 0;
+};
+
+namespace dma
+{
+  /// A block to arm an RX descriptor with. None when only the transmit
+  /// reserve is left: re-arm the descriptor with the block it had.
+  extern std::optional<packet_id> acquire();
+
+  /// Gives back a block: a sent frame, or a block taken off a descriptor
+  inline void release(packet_id p)                   { g_packet_pool.release(p); }
+
+  /// The whole block from its aligned start (c_packet_block_alignment).
+  /// A MAC that puts c_packet_headroom bytes in front of the frame by itself
+  /// (Kinetis ENET RACC/TACC SHIFT16 with c_packet_headroom = 2) gets this.
+  inline std::span<std::uint8_t> storage(packet_id p) { return g_packet_pool.storage(p); }
+
+  /// Where any other MAC writes the frame: storage + c_packet_headroom.
+  /// Set c_packet_headroom = 0 for those, so this is aligned as well.
+  inline std::span<std::uint8_t> receive_buffer(packet_id p)
+  {
+    return g_packet_pool.storage(p).subspan(c_packet_headroom);
+  }
+
+  /// The block a buffer address belongs to (HAL callbacks give addresses)
+  inline std::optional<packet_id> id_of(const void* address)
+  {
+    return g_packet_pool.id_of(address);
+  }
+} // namespace dma
+
+/// The next received frame, none when the ring has none ready
+template<typename F>
+concept dma_receive_function =
+  requires(F& f)
+  {
+    { f() } -> std::same_as<std::optional<rx_frame>>;
+  };
+
+/// Puts the frame on the TX ring and returns true; the driver then owns the
+/// block until reclaim gives it back. False when the ring is full.
+template<typename F>
+concept dma_transmit_function =
+  requires(F& f, packet_id p, std::span<const std::uint8_t> frame)
+  {
+    { f(p, frame) } -> std::convertible_to<bool>;
+  };
+
+/// A block whose frame the MAC has sent, none when no more
+template<typename F>
+concept dma_reclaim_function =
+  requires(F& f)
+  {
+    { f() } -> std::same_as<std::optional<packet_id>>;
+  };
+
+/// step() for DMA drivers: takes back the sent blocks, handles the received
+/// frames and gives the frames to send to the driver. With several
+/// interfaces the functions are called for each, like step().
+///
+/// \code {.cpp}
+/// ipv4::step_dma
+/// (
+///   []                                 { return enet.receive(); },
+///   [](ipv4::packet_id p, auto frame)  { return enet.transmit(p, frame); },
+///   []                                 { return enet.reclaim(); },
+///   []                                 { return millis(); }   // optional
+/// );
+/// \endcode
+template
+<
+  dma_receive_function    ReceiveFunction,
+  dma_transmit_function   TransmitFunction,
+  dma_reclaim_function    ReclaimFunction,
+  clock_function          ClockFunction = no_clock
+>
+inline void
+step_dma
+(
+  ReceiveFunction   receive,
+  TransmitFunction  transmit,
+  ReclaimFunction   reclaim,
+  ClockFunction     now = {}
+)
+{
+  std::uint32_t tick;
+
+  if constexpr (std::same_as<ClockFunction, no_clock>)
+    tick = detail::count_step();
+  else
+    tick = static_cast<std::uint32_t>(now());
+
+  // True when the driver took the frame
+  auto send = [&transmit](packet_id p) -> bool
+  {
+    const std::span<const std::uint8_t> frame = detail::data(p);
+
+    if (transmit(p, frame))
+    {
+      detail::handed_over(p);
+      return true;
+    }
+
+    detail::refused(p);
+    return false;
+  };
+
+  for (interface_designator id = 0; id < c_interface_table_size; ++id)
+  {
+    // 1. Sent blocks back to the pool first: they are what the RX ring
+    //    is refilled from
+    while (auto p = reclaim())
+      dma::release(*p);
+
+    // 2. Frames refused earlier go out first, in order
+    bool busy = false;
+
+    while (auto p = detail::waiting_frame())
+    {
+      if (!send(*p))
+      {
+        busy = true;
+        break;
+      }
+      detail::pop_waiting_frame();
+    }
+
+    // 3. Received frames. At most one ring's worth per step, so a flood
+    //    cannot keep step_dma() from returning.
+    for (std::size_t n = 0; n < c_packet_pool_size; ++n)
+    {
+      auto frame = receive();
+
+      if (!frame)
+        break;
+
+      if (auto reply = detail::process_received_frame(id, frame->id, frame->size))
+      {
+        if (busy || !send(*reply))
+        {
+          busy = true;
+          detail::keep_waiting_frame(*reply);
+        }
+      }
+    }
+
+    // 4. Datagrams and ARP requests, only while the driver takes frames: the
+    //    rest stay queued, nothing is lost
+    if (!busy)
+    {
+      while (auto frame = detail::next_transmit_frame(id, tick))
+      {
+        if (!send(*frame))
+        {
+          detail::keep_waiting_frame(*frame);
+          break;
+        }
+      }
+    }
   }
 }
 

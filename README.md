@@ -38,6 +38,40 @@ for (;;)
 The copying `udp::send(ed, data, size, remote)` and
 `udp::receive(ed, data, size, remote)` are available too.
 
+### DMA drivers
+
+With a MAC whose DMA descriptors point to buffers, `step_dma()` lends the
+pool blocks to the descriptors, so frames are not copied at all:
+
+```cpp
+ipv4::step_dma
+(
+  []                                { return enet.receive(); },   // std::optional<ipv4::rx_frame>
+  [](ipv4::packet_id p, auto frame) { return enet.transmit(p, frame); },  // false: TX ring full
+  []                                { return enet.reclaim(); },   // std::optional<ipv4::packet_id>
+  []                                { return millis(); }          // optional clock
+);
+```
+
+- Receive: each RX descriptor always holds a block. When a frame is in,
+  the driver swaps the block for one from `ipv4::dma::acquire()` and returns
+  `{id, size}`; when there is none it re-arms the same block and drops the
+  frame, so the ring never runs empty.
+- Transmit: the driver owns the block until the frame is sent, then
+  `reclaim` hands it back. A refused frame is sent again at the next step.
+- The frame starts `c_packet_headroom` bytes into `dma::storage(id)`. Use
+  `storage()` with a MAC that inserts those bytes itself (Kinetis ENET
+  SHIFT16, headroom 2), `dma::receive_buffer()` otherwise (headroom 0).
+- `dma::id_of(address)` maps a buffer address from a HAL callback back to
+  its block.
+- Size the pool for the rings:
+  `c_packet_pool_size >= RX descriptors + TX descriptors + datagrams waiting on ports + c_tx_reserved_blocks`.
+- On a core with a data cache (STM32F7) put the pool in a non cacheable
+  region, e.g. `-DPROTOCOL_IPV4_PACKET_POOL_ATTRIBUTES='__attribute__((section(".eth_ram")))'`
+  with `.eth_ram` NOLOAD in the linker script, or clean / invalidate the
+  blocks around DMA. `initialize()` resets the pool, the section needs no
+  zeroing at start up.
+
 ## Building and testing
 
 Needs a C++20 compiler and the [haluj](https://github.com/siyikalender/haluj)
