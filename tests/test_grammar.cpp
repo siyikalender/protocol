@@ -32,6 +32,7 @@ For more information, please refer to <http://unlicense.org>
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <span>
 #include <vector>
 
 #include "protocol/ipv4/grammar.hpp"
@@ -60,6 +61,32 @@ static_assert([]
          p.sender_ip == address{10, 0, 0, 1} &&
          p.target_ip == address{10, 0, 0, 2} &&
          p.sender_hw == protocol::ethernet::address{2, 0, 0, 0, 0, 1};
+}());
+
+// An IPv4 header with one word of options (IHL 6), then a UDP header
+constexpr std::array<std::uint8_t, 32> c_ipv4_udp =
+{
+  0x46, 0xB8, 0x00, 0x20,   0x12, 0x34, 0x40, 0x00,   64, 17, 0x00, 0x00,
+  10, 0, 0, 1,              10, 0, 0, 2,
+  0x01, 0x01, 0x01, 0x00,                             // options: NOP NOP NOP EOL
+  0x1F, 0x40, 0x00, 0x07,   0x00, 0x08, 0xAB, 0xCD    // UDP 8000 -> 7, length 8
+};
+
+static_assert([]
+{
+  grammar::ipv4_header h;
+  return grammar::parse_ipv4_header(c_ipv4_udp, h) &&
+         h.version == 4 && h.ihl == 6 && h.header_length() == 24 &&
+         h.total_length == 32 && h.flags_fragment == 0x4000 && h.protocol == 17 &&
+         h.source == address{10, 0, 0, 1} && h.destination == address{10, 0, 0, 2};
+}());
+
+static_assert([]
+{
+  grammar::udp_header u;
+  return grammar::parse_udp_header(std::span(c_ipv4_udp).subspan(24), u) &&
+         u.source_port == 8000 && u.destination_port == 7 &&
+         u.length == 8 && u.checksum == 0xABCD;
 }());
 
 static_assert(grammar::parse_icmp_echo_request(std::array<std::uint8_t, 8>{8, 0, 0, 0, 0, 1, 0, 2}));
@@ -102,6 +129,30 @@ int main()
     std::deque<std::uint8_t> d(c_request.begin(), c_request.end());
     grammar::arp_packet p;
     PROTOCOL_CHECK(grammar::parse_arp(d, p) && p.sender_ip == address{10, 0, 0, 1});
+  }
+
+  // IPv4: the options the IHL announces must be there
+  for (std::size_t n = 20; n < 24; ++n)
+  {
+    grammar::ipv4_header h;
+    PROTOCOL_CHECK(!grammar::parse_ipv4_header(std::span(c_ipv4_udp).first(n), h));
+  }
+
+  // IPv4: an IHL below 5 still reads the fixed header; the caller rejects it
+  {
+    auto bad = c_ipv4_udp;
+    bad[0] = 0x43;
+    grammar::ipv4_header h;
+    PROTOCOL_CHECK(grammar::parse_ipv4_header(bad, h) && h.ihl == 3 && h.header_length() < 20);
+  }
+
+  // UDP: 8 bytes or nothing
+  for (std::size_t n = 0; n < 8; ++n)
+  {
+    grammar::udp_header u;
+    u.length = 0x55;
+    PROTOCOL_CHECK(!grammar::parse_udp_header(std::span(c_ipv4_udp).subspan(24, n), u));
+    PROTOCOL_CHECK(u.length == 0x55);
   }
 
   return protocol_test::report("test_grammar");

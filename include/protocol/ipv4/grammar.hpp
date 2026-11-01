@@ -2,9 +2,13 @@
 /// Received headers described as grammars of haluj::parser, field by field
 /// in the order of their specification.
 ///
-/// haluj::parser works on any iterator; its character rules suit text, so
-/// the few rules binary headers need are here: a byte or a big endian word
-/// of a given value, a field skipped, and a field copied out.
+/// A grammar takes the fields out of a header and checks what is fixed in
+/// it (a type, a length). What depends on several fields or on the packet
+/// around the header (checksums, lengths against the frame, fragments) is
+/// checked by the code that uses the header.
+///
+/// Each parse function fills its output only when the whole header
+/// matched, and ignores the bytes after the header.
 /*
 This is free and unencumbered software released into the public domain.
 
@@ -37,11 +41,8 @@ For more information, please refer to <http://unlicense.org>
 #ifndef PROTOCOL_IPV4_GRAMMAR_HPP
 #define PROTOCOL_IPV4_GRAMMAR_HPP
 
-#include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <iterator>
-#include <span>
 
 #include "haluj/parser.hpp"
 
@@ -58,120 +59,24 @@ namespace ipv4
 namespace grammar
 {
 
-// ---- binary rules ----------------------------------------------------------
-
-/// One byte of the given value. haluj::ch() compares with a char, which is
-/// signed on some targets: a byte above 0x7F would never match.
-struct byte_p
+/// A field of n bytes
+constexpr auto bytes(int n)
 {
-  std::uint8_t value;
+  return haluj::nt(n, haluj::anychar());
+}
 
-  template<typename Iterator>
-  constexpr bool accept(Iterator& first, Iterator last) const
-  {
-    if (first == last || static_cast<std::uint8_t>(*first) != value)
-      return false;
-    ++first;
-    return true;
-  }
-};
-
-constexpr byte_p byte(std::uint8_t value) { return {value}; }
-
-/// A big endian 16 bit word of the given value
-struct be16_p
+/// Runs rule over the range; on a match out becomes value
+template<typename Rule, typename Range, typename Value>
+constexpr bool parse(const Rule& rule, const Range& range, const Value& value, Value& out)
 {
-  std::uint16_t value;
+  auto first = std::begin(range);
 
-  template<typename Iterator>
-  constexpr bool accept(Iterator& first, Iterator last) const
-  {
-    return byte_p{static_cast<std::uint8_t>(value >> 8)}.accept(first, last) &&
-           byte_p{static_cast<std::uint8_t>(value)}.accept(first, last);
-  }
-};
+  if (!rule.accept(first, std::end(range)))
+    return false;
 
-constexpr be16_p be16(std::uint16_t value) { return {value}; }
-
-namespace grammar_detail
-{
-  /// Takes n elements when there are that many, in one step for random
-  /// access iterators (one bounds check per field, not per byte)
-  template<typename Iterator>
-  constexpr bool take(Iterator& first, Iterator last, std::size_t n)
-  {
-    if constexpr (std::random_access_iterator<Iterator>)
-    {
-      if (static_cast<std::size_t>(last - first) < n)
-        return false;
-      first += static_cast<std::ptrdiff_t>(n);
-      return true;
-    }
-    else
-    {
-      Iterator at = first;
-      for (; n > 0; --n, ++at)
-        if (at == last)
-          return false;
-      first = at;
-      return true;
-    }
-  }
-} // namespace grammar_detail
-
-/// A field of N bytes whose value does not matter here
-template<std::size_t N>
-struct skip_p
-{
-  template<typename Iterator>
-  constexpr bool accept(Iterator& first, Iterator last) const
-  {
-    return grammar_detail::take(first, last, N);
-  }
-};
-
-template<std::size_t N>
-constexpr skip_p<N> skip() { return {}; }
-
-/// A field copied to an address (Ethernet or IPv4) when it matched
-template<typename Address>
-struct into_p
-{
-  Address& out;
-
-  template<typename Iterator>
-  constexpr bool accept(Iterator& first, Iterator last) const
-  {
-    const Iterator at = first;
-    if (!grammar_detail::take(first, last, out.size()))
-      return false;
-    std::copy_n(at, out.size(), out.begin());
-    return true;
-  }
-};
-
-template<typename Address>
-constexpr into_p<Address> into(Address& out) { return {out}; }
-
-/// A big endian 16 bit field of any value, stored in out
-struct be16_into_p
-{
-  std::uint16_t& out;
-
-  template<typename Iterator>
-  constexpr bool accept(Iterator& first, Iterator last) const
-  {
-    Iterator at = first;
-    if (!grammar_detail::take(first, last, 2))
-      return false;
-    const auto high = static_cast<std::uint8_t>(*at);
-    ++at;
-    out = static_cast<std::uint16_t>((high << 8) | static_cast<std::uint8_t>(*at));
-    return true;
-  }
-};
-
-constexpr be16_into_p be16_into(std::uint16_t& out) { return {out}; }
+  out = value;
+  return true;
+}
 
 // ---- ARP (RFC 826) ------------------------------------------------------------
 
@@ -183,56 +88,129 @@ struct arp_packet
   address           target_ip{};
 };
 
-/// An ARP packet for IPv4 over Ethernet. Fills \p out only when the whole
-/// packet matches; bytes after the packet (Ethernet padding) are ignored.
+/// An ARP packet for IPv4 over Ethernet
 template<typename Range>
 constexpr bool parse_arp(const Range& packet, arp_packet& out)
 {
-  using haluj::seq;
+  using namespace haluj;
 
   arp_packet p;
 
   const auto rule =
     seq
     (
-      be16(1),                    // ar$hrd  hardware address space: Ethernet
-      be16(wire::eth::type_ipv4), // ar$pro  protocol address space: IPv4
-      byte(6),                    // ar$hln  hardware address length
-      byte(4),                    // ar$pln  protocol address length
-      be16_into(p.opcode),        // ar$op   ares_op$REQUEST | ares_op$REPLY
-      into(p.sender_hw),          // ar$sha
-      into(p.sender_ip),          // ar$spa
-      skip<6>(),                  // ar$tha  not needed: our own address, or unknown
-      into(p.target_ip)           // ar$tpa
+      be16(1),                                        // ar$hrd  hardware address space: Ethernet
+      be16(wire::eth::type_ipv4),                     // ar$pro  protocol address space: IPv4
+      u8(6),                                          // ar$hln  hardware address length
+      u8(4),                                          // ar$pln  protocol address length
+      action(bytes(2), store_be(p.opcode)),           // ar$op   REQUEST or REPLY
+      action(bytes(6), store_bytes(p.sender_hw)),     // ar$sha
+      action(bytes(4), store_bytes(p.sender_ip)),     // ar$spa
+      bytes(6),                                       // ar$tha  not needed
+      action(bytes(4), store_bytes(p.target_ip))      // ar$tpa
     );
 
-  auto first = std::begin(packet);
-
-  if (!rule.accept(first, std::end(packet)))
-    return false;
-
-  out = p;
-  return true;
+  return parse(rule, packet, p, out);
 }
 
-// ---- ICMP echo request (RFC 792) -----------------------------------------------
+// ---- IPv4 header (RFC 791) -------------------------------------------------------
 
-/// An echo request: type 8, code 0, checksum, identifier, sequence number,
-/// data. The checksum covers the whole message, so it is checked apart.
-template<typename Range>
-constexpr bool parse_icmp_echo_request(const Range& message)
+struct ipv4_header
 {
-  using haluj::seq;
+  std::uint8_t      version         = 0;
+  std::uint8_t      ihl             = 0;    ///< header length in 32 bit words
+  std::uint16_t     total_length    = 0;
+  std::uint16_t     flags_fragment  = 0;
+  std::uint8_t      protocol        = 0;
+  address           source{};
+  address           destination{};
+
+  constexpr std::size_t header_length() const { return ihl * 4U; }
+};
+
+/// An IPv4 header with its options. Version, IHL, lengths, checksum and
+/// fragments are for the caller to check.
+template<typename Range>
+constexpr bool parse_ipv4_header(const Range& packet, ipv4_header& out)
+{
+  using namespace haluj;
+
+  ipv4_header h;
+  int         options = 0;   // bytes of options, from the IHL
+
+  const auto version_ihl = [&](auto first, auto)
+  {
+    const wire::ip::version_ihl_t v(static_cast<std::uint8_t>(*first));
+    h.version = static_cast<std::uint8_t>(v.value_of<wire::ip::version>());
+    h.ihl     = static_cast<std::uint8_t>(v.value_of<wire::ip::ihl>());
+    options   = static_cast<int>(h.ihl) * 4 - static_cast<int>(wire::ip::min_size);
+  };
 
   const auto rule =
     seq
     (
-      byte(wire::icmp::echo_request), // type
-      byte(0),                        // code
-      skip<2>(),                      // checksum
-      skip<2>(),                      // identifier
-      skip<2>(),                      // sequence number
-      haluj::rest()                   // data
+      action(bytes(1), version_ihl),                    // Version, IHL
+      bytes(1),                                         // Type of Service
+      action(bytes(2), store_be(h.total_length)),       // Total Length
+      bytes(2),                                         // Identification
+      action(bytes(2), store_be(h.flags_fragment)),     // Flags, Fragment Offset
+      bytes(1),                                         // Time to Live
+      action(bytes(1), store_be(h.protocol)),           // Protocol
+      bytes(2),                                         // Header Checksum
+      action(bytes(4), store_bytes(h.source)),          // Source Address
+      action(bytes(4), store_bytes(h.destination)),     // Destination Address
+      vt(options, anychar())                            // Options (none when IHL <= 5)
+    );
+
+  return parse(rule, packet, h, out);
+}
+
+// ---- UDP header (RFC 768) ----------------------------------------------------------
+
+struct udp_header
+{
+  std::uint16_t source_port       = 0;
+  std::uint16_t destination_port  = 0;
+  std::uint16_t length            = 0;
+  std::uint16_t checksum          = 0;
+};
+
+template<typename Range>
+constexpr bool parse_udp_header(const Range& datagram, udp_header& out)
+{
+  using namespace haluj;
+
+  udp_header u;
+
+  const auto rule =
+    seq
+    (
+      action(bytes(2), store_be(u.source_port)),        // Source Port
+      action(bytes(2), store_be(u.destination_port)),   // Destination Port
+      action(bytes(2), store_be(u.length)),             // Length
+      action(bytes(2), store_be(u.checksum))            // Checksum
+    );
+
+  return parse(rule, datagram, u, out);
+}
+
+// ---- ICMP echo request (RFC 792) -----------------------------------------------
+
+/// An echo request: type 8, code 0, then checksum, identifier, sequence
+/// number and data, which the reply keeps as they are
+template<typename Range>
+constexpr bool parse_icmp_echo_request(const Range& message)
+{
+  using namespace haluj;
+
+  const auto rule =
+    seq
+    (
+      u8(wire::icmp::echo_request),   // Type
+      u8(0),                          // Code
+      bytes(2),                       // Checksum
+      bytes(2),                       // Identifier
+      bytes(2)                        // Sequence Number
     );
 
   auto first = std::begin(message);

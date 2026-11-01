@@ -376,17 +376,17 @@ verdict process_icmp
 verdict process_udp(interface_designator id, packet_id p, const std::uint8_t* h)
 {
   std::span<std::uint8_t> u = g_packet_pool.data(p);
+  grammar::udp_header     header;
 
-  if (u.size() < wire::udp::size)
+  if (!grammar::parse_udp_header(u, header))
     return invalid();
 
-  const std::size_t length = load16(u.data() + wire::udp::length);
+  const std::size_t length = header.length;
 
   if (length < wire::udp::size || length > u.size())
     return invalid();
 
-  if (c_verify_rx_checksums &&
-      load16(u.data() + wire::udp::checksum) != 0)  // 0: the sender left it out
+  if (c_verify_rx_checksums && header.checksum != 0)   // 0: the sender left it out
   {
     const bool ok = internet_checksum()
                       .add({h + ip::source, 8})
@@ -398,7 +398,7 @@ verdict process_udp(interface_designator id, packet_id p, const std::uint8_t* h)
       return invalid();
   }
 
-  const std::uint16_t destination_port = load16(u.data() + wire::udp::destination_port);
+  const std::uint16_t destination_port = header.destination_port;
 
   auto port = std::find_if(g_udp_ports.begin(), g_udp_ports.end(),
                            [&](const port_descriptor& d)
@@ -438,15 +438,15 @@ verdict process_ipv4(interface_designator id, const interface& itf, packet_id p,
 {
   std::span<std::uint8_t> packet = g_packet_pool.data(p);
   std::uint8_t*           h      = packet.data();
+  grammar::ipv4_header    header;
 
-  if (packet.size() < ip::min_size)
+  if (!grammar::parse_ipv4_header(packet, header))
     return invalid();
 
-  const ip::version_ihl_t vi(h[ip::version_ihl]);
-  const std::size_t       header_length = vi.value_of<ip::ihl>() * 4U;
-  const std::size_t       total_length  = load16(h + ip::total_length);
+  const std::size_t header_length = header.header_length();
+  const std::size_t total_length  = header.total_length;
 
-  if (vi.value_of<ip::version>() != 4 ||
+  if (header.version != 4 ||
       header_length < ip::min_size ||
       total_length < header_length ||
       total_length > packet.size())        // never trust a length the frame does not hold
@@ -458,12 +458,12 @@ verdict process_ipv4(interface_designator id, const interface& itf, packet_id p,
     return invalid();
 
   // Fragments are not reassembled
-  const ip::flags_fragment_t ff(load16(h + ip::flags_fragment));
+  const ip::flags_fragment_t ff(header.flags_fragment);
   if (ff.test<ip::more_fragments>() || ff.value_of<ip::fragment_offset>() != 0)
     return not_for_us();
 
-  const auto destination = load<address>(h + ip::destination);
-  const bool unicast     = destination == itf.ip_addr;
+  const auto& destination = header.destination;
+  const bool  unicast     = destination == itf.ip_addr;
 
   if (!unicast && destination != c_broadcast_ip)
     return not_for_us();
@@ -471,7 +471,7 @@ verdict process_ipv4(interface_designator id, const interface& itf, packet_id p,
   g_packet_pool.trim(p, total_length);      // drops the Ethernet padding
   g_packet_pool.pull_header(p, header_length);
 
-  switch (h[ip::protocol])
+  switch (header.protocol)
   {
     case ip::udp:
       return process_udp(id, p, h);
