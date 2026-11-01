@@ -11,6 +11,10 @@ add_executable(protocol_test_pool test_pool.cpp)
 target_link_libraries(protocol_test_pool PRIVATE protocol::ipv4 protocol_warnings)
 add_test(NAME pool COMMAND protocol_test_pool)
 
+add_executable(protocol_test_grammar test_grammar.cpp)
+target_link_libraries(protocol_test_grammar PRIVATE protocol::ipv4 protocol_warnings)
+add_test(NAME grammar COMMAND protocol_test_grammar)
+
 # The stack state is global: every case runs in its own process
 function(protocol_cases executable source)
   add_executable(${executable} ${source})

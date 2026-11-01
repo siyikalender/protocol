@@ -35,6 +35,7 @@ For more information, please refer to <http://unlicense.org>
 #include <cstring>
 
 #include "protocol/ipv4/stack.hpp"
+#include "protocol/ipv4/grammar.hpp"
 #include "protocol/ipv4/wire.hpp"
 
 namespace protocol
@@ -286,23 +287,13 @@ verdict not_for_us()  { ++g_stats.rx_not_for_us; return verdict::drop; }
 
 verdict process_arp(const interface& itf, packet_id p, std::uint8_t* e)
 {
-  std::uint8_t* a = g_packet_pool.pull_header(p, arp::size);
+  grammar::arp_packet arp_in;
 
-  if (a == nullptr)
+  if (!grammar::parse_arp(g_packet_pool.data(p), arp_in))
     return invalid();
 
-  if (load16(a + arp::hardware_type) != 1 ||
-      load16(a + arp::protocol_type) != eth::type_ipv4 ||
-      a[arp::hardware_length] != 6 ||
-      a[arp::protocol_length] != 4)
-  {
-    return invalid();
-  }
-
-  const auto  sender_hw = load<ethernet::address>(a + arp::sender_hw);
-  const auto  sender_ip = load<address>(a + arp::sender_ip);
-  const auto  target_ip = load<address>(a + arp::target_ip);
-  const auto  opcode    = load16(a + arp::opcode);
+  const auto& [opcode, sender_hw, sender_ip, target_ip] = arp_in;
+  std::uint8_t* a = g_packet_pool.data(p).data();   // the reply is written here
 
   // RFC 826: an entry for the sender is updated whoever the packet is for
   bool known = false;
@@ -359,7 +350,7 @@ verdict process_icmp
   if (c_verify_rx_checksums && !internet_checksum().add(m).verifies())
     return invalid();
 
-  if (m[icmp::type] != icmp::echo_request || m[icmp::code] != 0)
+  if (!grammar::parse_icmp_echo_request(m))
     return not_for_us();
 
   // The request becomes the reply in place: the echo data stays where it is
