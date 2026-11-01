@@ -119,5 +119,21 @@ int main()
     g_pool.release(p);
   }
 
+  // storage and id_of: what DMA drivers use
+  {
+    auto p = *g_pool.acquire();
+    auto q = *g_pool.acquire();
+    auto s = g_pool.storage(q);
+    PROTOCOL_CHECK(s.size() == 1536);
+    PROTOCOL_CHECK(s.data() == g_pool.base(q));
+    PROTOCOL_CHECK(g_pool.id_of(s.data()) == q);
+    PROTOCOL_CHECK(g_pool.id_of(s.data() + 1535) == q);
+    PROTOCOL_CHECK(g_pool.id_of(g_pool.base(p) + 2) == p);
+    PROTOCOL_CHECK(!g_pool.id_of(s.data() + 1536).has_value());   // offset/length, not data
+    int elsewhere = 0;
+    PROTOCOL_CHECK(!g_pool.id_of(&elsewhere).has_value());
+    g_pool.reset();
+  }
+
   return protocol_test::report("test_pool");
 }

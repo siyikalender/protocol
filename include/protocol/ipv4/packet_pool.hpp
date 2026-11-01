@@ -206,6 +206,34 @@ public:
     return m_blocks[p.index].data.data();
   }
 
+  /// The whole storage of the block, from its aligned start: what a DMA
+  /// descriptor points to
+  constexpr std::span<std::uint8_t> storage(const packet_id p)
+  {
+    return m_blocks[p.index].data;
+  }
+
+  /// The block that \p address points into, none when it points elsewhere.
+  /// For drivers whose HAL hands back buffer addresses instead of ids.
+  std::optional<packet_id> id_of(const void* address) const
+  {
+    // Integer arithmetic: comparing pointers into unrelated objects with <
+    // is unspecified in C++
+    const auto a     = reinterpret_cast<std::uintptr_t>(address);
+    const auto first = reinterpret_cast<std::uintptr_t>(m_blocks.data());
+
+    if (a < first)
+      return std::nullopt;
+
+    const std::size_t index  = (a - first) / sizeof(block);
+    const std::size_t offset = (a - first) % sizeof(block);
+
+    if (index >= Count || offset >= BlockSize)
+      return std::nullopt;
+
+    return packet_id{static_cast<std::uint8_t>(index)};
+  }
+
 private:
   // Bit i set: block i is in use. Every member starts as zero, so a global
   // pool goes to .bss: no flash copy and no start up code.
