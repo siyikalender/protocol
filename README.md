@@ -66,13 +66,21 @@ for (;;)
 
 - RFC 9293 state machine, RFC 5961 protection against blind RST and SYN,
   RFC 6298 retransmission timer, RFC 6528 initial sequence numbers (seed
-  them with `tcp::set_secret()` from an RNG), fast retransmit on three
-  duplicate ACKs, zero window probes, MSS option.
+  them with `tcp::set_secret()` from an RNG), zero window probes, MSS
+  option.
+- Loss recovery: fast retransmit on duplicate ACKs (RFC 5681), fewer of
+  them when only a few segments are out (early retransmit, RFC 5827), the
+  next hole sent at once on a partial ACK (NewReno, RFC 6582).
+- Segments received out of order are kept in their blocks until the gap is
+  filled (they share the `PROTOCOL_IPV4_TCP_RX_SEGMENTS` blocks with data in
+  order, and give them up to it); each is answered by a duplicate ACK
+  without data.
 - Sent segments stay in their pool blocks until acknowledged and are sent
   again from there: no send buffer, no copy.
-- Not done: reassembly of segments received out of order (they are dropped
-  and the peer sends them again), congestion control (RFC 5681), window
-  scaling, SACK, timestamps. On a LAN these matter little.
+- Not done: congestion control (RFC 5681), window scaling, SACK,
+  timestamps. Without SACK, a peer that sends data while acknowledging
+  (both directions busy) gives no duplicate ACKs, so a loss there waits
+  for the retransmission timer.
 
 ### DMA drivers
 

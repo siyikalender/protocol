@@ -140,7 +140,8 @@ struct statistics
   uint32_t tx_busy              = 0;  ///< step_dma(): the driver refused a frame
   uint32_t tx_reply_dropped     = 0;  ///< step_dma(): a reply found no room to wait
   uint32_t tcp_retransmits      = 0;  ///< TCP segments sent again
-  uint32_t tcp_rx_refused       = 0;  ///< TCP data dropped: out of order, no room
+  uint32_t tcp_rx_refused       = 0;  ///< TCP data dropped: no room
+  uint32_t tcp_rx_out_of_order  = 0;  ///< TCP segments kept ahead of a gap
   uint32_t tcp_resets_sent      = 0;
 };
 

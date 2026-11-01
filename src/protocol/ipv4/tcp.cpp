@@ -128,6 +128,14 @@ constexpr std::size_t c_syn_offset  = c_data_offset + wire::tcp::option_mss_size
 
 static_assert(c_data_offset + c_tcp_mss <= c_packet_block_size);
 
+/// Data received ahead of a gap, kept until the gap is filled
+struct ooo_segment
+{
+  packet_id     id;
+  std::uint32_t seq;
+  bool          fin;      ///< a FIN follows the data
+};
+
 /// Transmission control block (3.3.1)
 struct tcb
 {
@@ -156,9 +164,13 @@ struct tcb
   std::uint32_t         rcv_adv     = 0;              ///< right edge of the window announced
   haluj::bounded::vector<packet_id, c_tcp_rx_segments> rx;
   std::size_t           rx_bytes    = 0;
+  /// Out of order, by sequence number; shares the c_tcp_rx_segments blocks
+  /// with rx
+  haluj::bounded::vector<ooo_segment, c_tcp_rx_segments> ooo;
 
   // Control segments to send
   bool                  ack_now     = false;
+  std::uint8_t          dupacks_owed = 0;            ///< RFC 5681 4.2: one ACK alone per segment out of order
   bool                  rst_now     = false;
 
   // Retransmission and persist timer (RFC 6298)
@@ -173,6 +185,8 @@ struct tcb
   std::uint32_t         rtt_seq     = 0;
   std::uint32_t         rtt_start   = 0;
   std::uint8_t          dupacks     = 0;
+  bool                  in_recovery = false;          ///< RFC 6582: until recover is acknowledged
+  std::uint32_t         recover     = 0;
   bool                  probe_now   = false;
 
   std::uint32_t         time_wait_start = 0;
@@ -313,6 +327,10 @@ void drop_buffers(tcb& c)
   c.rx.clear();
   c.rx_bytes = 0;
 
+  for (auto& o : c.ooo)
+    g_packet_pool.release(o.id);
+  c.ooo.clear();
+
   for (auto& s : c.tx)
     unpin(s.id);
   c.tx.clear();
@@ -327,6 +345,7 @@ void end(tcb& c, ipv4::tcp::status why)
   c.error         = why;
   c.timer_running = false;
   c.ack_now       = false;
+  c.dupacks_owed  = 0;
   c.listener      = c_no_listener;   // never accepted: nobody will
 }
 
@@ -337,7 +356,7 @@ constexpr std::uint32_t c_rx_capacity = c_tcp_rx_segments * c_tcp_mss;
 /// taken, so the bytes read from it give no room yet.
 std::uint32_t receive_space(const tcb& c)
 {
-  const std::size_t slots = c_tcp_rx_segments - c.rx.size();
+  const std::size_t slots = c_tcp_rx_segments - c.rx.size() - c.ooo.size();
   const std::size_t pool  = g_packet_pool.available() > c_tx_reserved_blocks + 1
                               ? g_packet_pool.available() - c_tx_reserved_blocks - 1 : 0;
   return static_cast<std::uint32_t>(std::min(slots, pool) * c_tcp_mss);
@@ -506,6 +525,16 @@ void acknowledge(tcb& c, std::uint32_t ack)
     c.rtt_timing = false;
   }
 
+  // RFC 6582 3.2: an ACK short of recover shows the next hole
+  bool partial = false;
+  if (c.in_recovery)
+  {
+    if (seq_ge(ack, c.recover))
+      c.in_recovery = false;
+    else
+      partial = true;
+  }
+
   while (!c.tx.empty())
   {
     tx_segment& s = c.tx.front();
@@ -539,6 +568,26 @@ void acknowledge(tcb& c, std::uint32_t ack)
     c.timer_running = false;
   else
     c.timer_start = g_now;          // RFC 6298 5.3
+
+  if (partial)
+    retransmit_first(c);
+}
+
+/// Duplicate ACKs that show a loss: three (RFC 5681), fewer when fewer
+/// segments are out to cause them (early retransmit, RFC 5827)
+std::uint8_t duplicate_threshold(const tcb& c)
+{
+  const auto out = std::count_if(c.tx.begin(), c.tx.end(), [](const tx_segment& s)
+                                 { return s.flags.test<seg_sent>() && s.length > 0; });
+  return out >= 4 || out < 2 ? 3 : static_cast<std::uint8_t>(out - 1);
+}
+
+/// Fast retransmit; recovery lasts until all sent now is acknowledged
+void enter_recovery(tcb& c)
+{
+  retransmit_first(c);
+  c.in_recovery = true;
+  c.recover     = c.snd_nxt;
 }
 
 bool fin_acknowledged(const tcb& c)
@@ -568,9 +617,22 @@ void established(tcb& c, const grammar::tcp_header& th)
 
 /// Received data in order: kept in the block, or copied to the end of the
 /// last block when it fits there (small segments do not take a block each)
-enum class stored { copied, kept, refused };
+enum class stored { copied, kept, refused, duplicate };
 
-stored store_data(tcb& c, packet_id p)
+/// Frees the block of the out of order segment furthest ahead: in order
+/// data, or data nearer the gap, needs it more
+bool evict_out_of_order(tcb& c)
+{
+  if (c.ooo.empty())
+    return false;
+  g_packet_pool.release(c.ooo.back().id);
+  c.ooo.pop_back();
+  return true;
+}
+
+/// fresh: the block has just come in (not from the out of order queue), so
+/// the pool must spare it
+stored store_data(tcb& c, packet_id p, bool fresh = true)
 {
   const auto data = g_packet_pool.data(p);
 
@@ -591,12 +653,134 @@ stored store_data(tcb& c, packet_id p)
   }
 
   // The same rule as UDP: the next frame and the transmit reserve stay
-  if (c.rx.full() || g_packet_pool.available() < c_tx_reserved_blocks + 1)
-    return stored::refused;
+  while (c.rx.size() + c.ooo.size() >= c_tcp_rx_segments ||
+         (fresh && g_packet_pool.available() < c_tx_reserved_blocks + 1))
+  {
+    if (!evict_out_of_order(c))
+      return stored::refused;
+  }
 
   c.rx.push_back(p);
   c.rx_bytes += data.size();
   return stored::kept;
+}
+
+/// The FIN came in order (3.10.7.4, eighth check)
+void fin_arrived(tcb& c)
+{
+  c.rcv_nxt += 1;
+  c.ack_now  = true;
+
+  // Nothing comes after the FIN
+  while (evict_out_of_order(c)) {}
+
+  switch (c.state)
+  {
+    case tcp_state::established:
+      c.state = tcp_state::close_wait;
+      break;
+    case tcp_state::fin_wait_1:
+      if (fin_acknowledged(c))
+        enter_time_wait(c);
+      else
+        c.state = tcp_state::closing;
+      break;
+    case tcp_state::fin_wait_2:
+    case tcp_state::time_wait:
+      enter_time_wait(c);
+      break;
+    default:
+      break;
+  }
+}
+
+/// Keeps a segment that came ahead of a gap (its payload in p, starting at
+/// seq)
+stored store_out_of_order(tcb& c, packet_id p, std::uint32_t seq, bool fin)
+{
+  std::uint32_t length = static_cast<std::uint32_t>(g_packet_pool.data(p).size());
+
+  // Only what the window announced
+  const std::uint32_t room = seq_gt(c.rcv_adv, seq) ? c.rcv_adv - seq : 0;
+  if (length > room)
+  {
+    length = room;
+    fin    = false;
+    g_packet_pool.trim(p, length);
+  }
+  if (length == 0 && !fin)
+    return stored::refused;
+
+  // Where it goes; nothing new when a segment kept already covers it
+  std::size_t at = 0;
+  for (; at < c.ooo.size(); ++at)
+  {
+    const ooo_segment&  o     = c.ooo[at];
+    const std::uint32_t o_end = o.seq + static_cast<std::uint32_t>(g_packet_pool.data(o.id).size());
+
+    if (seq_le(o.seq, seq) && seq_ge(o_end, seq + length) && (o.fin || !fin || o_end != seq + length))
+      return stored::duplicate;
+    if (seq_gt(o.seq, seq))
+      break;
+  }
+
+  // Room: the block of a segment further ahead is given up for it
+  while (c.rx.size() + c.ooo.size() >= c_tcp_rx_segments ||
+         g_packet_pool.available() < c_tx_reserved_blocks + 1)
+  {
+    if (at >= c.ooo.size())
+      return stored::refused;
+    evict_out_of_order(c);
+  }
+
+  c.ooo.push_back({p, seq, fin});
+  for (std::size_t j = c.ooo.size() - 1; j > at; --j)
+    c.ooo[j] = c.ooo[j - 1];
+  c.ooo[at] = {p, seq, fin};
+
+  ++g_stats.tcp_rx_out_of_order;
+  return stored::kept;
+}
+
+/// rcv_nxt moved: the segments kept that now follow it are received
+void deliver_out_of_order(tcb& c)
+{
+  while (!c.ooo.empty() && seq_le(c.ooo.front().seq, c.rcv_nxt))
+  {
+    const ooo_segment o = c.ooo.front();
+    for (std::size_t j = 0; j + 1 < c.ooo.size(); ++j)
+      c.ooo[j] = c.ooo[j + 1];
+    c.ooo.pop_back();
+
+    const std::uint32_t length = static_cast<std::uint32_t>(g_packet_pool.data(o.id).size());
+    const std::uint32_t end    = o.seq + length;
+    const std::uint32_t skip   = c.rcv_nxt - o.seq;
+
+    if (seq_gt(end, c.rcv_nxt))
+    {
+      g_packet_pool.pull_header(o.id, skip);
+      const stored s = c.discards() ? stored::copied : store_data(c, o.id, false);
+      if (s != stored::kept)
+        g_packet_pool.release(o.id);
+      if (s == stored::refused)       // never: its slot was given back above
+      {
+        ++g_stats.tcp_rx_refused;
+        while (evict_out_of_order(c)) {}
+        return;
+      }
+      c.rcv_nxt = end;
+    }
+    else
+    {
+      g_packet_pool.release(o.id);
+    }
+
+    if (o.fin && end == c.rcv_nxt)
+    {
+      fin_arrived(c);
+      return;
+    }
+  }
 }
 
 /// An answer to a segment for no connection (3.10.7.1), written in the
@@ -694,9 +878,11 @@ bool process_ack(tcb& c, const grammar::tcp_header& th, std::uint32_t seg_len)
   }
   else if (ack == c.snd_una && seg_len == 0 && th.window == c.snd_wnd && c.snd_una != c.snd_nxt)
   {
-    // Duplicate ACK: three in a row, the first segment was lost (RFC 5681)
-    if (++c.dupacks == 3)
-      retransmit_first(c);
+    // Duplicate ACK: enough in a row, the first segment was lost
+    if (c.dupacks < 0xFF)
+      ++c.dupacks;
+    if (!c.in_recovery && c.dupacks >= duplicate_threshold(c))
+      enter_recovery(c);
   }
 
   // Window update
@@ -855,22 +1041,35 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
   }
 
   // ---- seventh: data ----
-  verdict v          = verdict::drop;
-  bool    fin_in_order = seq_le(seq, c.rcv_nxt);
-
-  if (data_length > 0)
-  {
-    const bool takes_data = c.state == tcp_state::established ||
+  verdict    v            = verdict::drop;
+  bool       fin_in_order = seq_le(seq, c.rcv_nxt);
+  const bool takes_data   = c.state == tcp_state::established ||
                             c.state == tcp_state::fin_wait_1 ||
                             c.state == tcp_state::fin_wait_2;
 
-    if (!takes_data || seq_gt(seq, c.rcv_nxt))
+  if (seq_gt(seq, c.rcv_nxt) && (data_length > 0 || in.test<wire::tcp::FIN>()))
+  {
+    // Out of order: kept for later; the ACK of what we have makes the
+    // peer's duplicate ACKs start its fast retransmit
+    if (takes_data && !c.discards())
     {
-      // Out of order (or no more data expected): ACK what we have, so the
-      // peer's duplicate ACKs start its fast retransmit
-      if (takes_data)
+      const stored s = store_out_of_order(c, p, seq, in.test<wire::tcp::FIN>());
+      if (c.dupacks_owed < 3)
+        ++c.dupacks_owed;
+      if (s == stored::kept)
+        v = verdict::keep;
+      else if (s == stored::refused)
         ++g_stats.tcp_rx_refused;
-      c.ack_now    = true;
+    }
+    c.ack_now = true;
+    return v;
+  }
+
+  if (data_length > 0)
+  {
+    if (!takes_data)
+    {
+      c.ack_now    = true;              // no more data expected
       fin_in_order = false;
     }
     else
@@ -913,29 +1112,9 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
   // ---- eighth: FIN, in order only ----
   if (in.test<wire::tcp::FIN>() && fin_in_order &&
       seq + static_cast<std::uint32_t>(data_length) == c.rcv_nxt)
-  {
-    c.rcv_nxt += 1;
-    c.ack_now  = true;
-
-    switch (c.state)
-    {
-      case tcp_state::established:
-        c.state = tcp_state::close_wait;
-        break;
-      case tcp_state::fin_wait_1:
-        if (fin_acknowledged(c))
-          enter_time_wait(c);
-        else
-          c.state = tcp_state::closing;
-        break;
-      case tcp_state::fin_wait_2:
-      case tcp_state::time_wait:
-        enter_time_wait(c);
-        break;
-      default:
-        break;
-    }
-  }
+    fin_arrived(c);
+  else if (!c.ooo.empty())
+    deliver_out_of_order(c);
 
   return v;
 }
@@ -989,7 +1168,8 @@ void run_timers(tcb& c)
     return;
   }
 
-  retransmit_first(c);
+  c.dupacks = 0;
+  enter_recovery(c);      // RFC 6582: partial ACKs after a timeout too
 }
 
 /// The FIN close() asked for, after the data queued
@@ -1123,6 +1303,18 @@ std::optional<packet_id> next_frame(tcb& c)
     return next_frame(c);       // timed out: its RST
 
   queue_fin(c);
+
+  // Duplicate ACKs go without data: a peer counts only those (RFC 5681 2)
+  if (c.dupacks_owed > 0 && c.synchronized())
+  {
+    auto p = control_segment(c, c.snd_nxt, control_t().set<wire::tcp::ACK>());
+    if (p)
+    {
+      --c.dupacks_owed;
+      c.ack_now = false;
+    }
+    return p;
+  }
 
   if (auto p = next_segment(c))
     return p;
@@ -1616,6 +1808,9 @@ void close(connection h)
     g_packet_pool.release(p);
   c->rx.clear();
   c->rx_bytes = 0;
+  for (auto& o : c->ooo)
+    g_packet_pool.release(o.id);
+  c->ooo.clear();
 
   switch (c->state)
   {

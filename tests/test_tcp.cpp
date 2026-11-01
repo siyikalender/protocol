@@ -312,6 +312,41 @@ void tcp_fast_retransmit()
   auto s = segments();
   PROTOCOL_CHECK(!s.empty() && s.back().seq == p.ack && s.back().data.size() == 1460);
   PROTOCOL_CHECK(ipv4::stats().tcp_retransmits == 1);
+
+  // A partial ACK (RFC 6582): the next hole goes at once, without a timeout
+  g_tx.clear();
+  p.ack += 1460;
+  deliver({p.segment(ACK)});
+  s = segments();
+  PROTOCOL_CHECK(s.size() == 1 && s[0].seq == p.ack && s[0].data.size() == 1460);
+  PROTOCOL_CHECK(ipv4::stats().tcp_retransmits == 2);
+
+  // All acknowledged: recovery ends, nothing more is sent
+  g_tx.clear();
+  p.ack += 4000 - 1460;
+  deliver({p.segment(ACK)});
+  wait(ipv4::c_tcp_rto_initial * 2);
+  PROTOCOL_CHECK(segments().empty());
+  PROTOCOL_CHECK(ipv4::stats().tcp_retransmits == 2);
+}
+
+/// Two segments out: one duplicate ACK is all the peer can send (RFC 5827)
+void tcp_early_retransmit()
+{
+  setup();
+  auto l = ipv4::tcp::listen(0, 80);
+  peer p;
+  auto c = *open_passive(*l, 80, p);
+
+  const bytes out = frames::pattern(2000, 4);
+  ipv4::tcp::send(c, out.data(), out.size());
+  run_step(); run_step();
+  g_tx.clear();
+
+  deliver({p.segment(ACK)});
+  auto s = segments();
+  PROTOCOL_CHECK(s.size() == 1 && s[0].seq == p.ack && s[0].data.size() == 1460);
+  PROTOCOL_CHECK(ipv4::stats().tcp_retransmits == 1);
 }
 
 void tcp_zero_window_probe()
@@ -402,31 +437,130 @@ void tcp_we_close_first()
   PROTOCOL_CHECK(open_passive(*l, 80, q).has_value());
 }
 
-void tcp_out_of_order_dropped()
+/// Bytes [from, from + n) of a stream
+bytes slice(const bytes& stream, std::size_t from, std::size_t n)
+{
+  return bytes(stream.begin() + std::ptrdiff_t(from), stream.begin() + std::ptrdiff_t(from + n));
+}
+
+bytes read_all(ipv4::tcp::connection c)
+{
+  bytes b(ipv4::tcp::received_length(c));
+  b.resize(ipv4::tcp::receive(c, b.data(), b.size()));
+  return b;
+}
+
+void tcp_out_of_order_reassembly()
 {
   setup();
   auto l = ipv4::tcp::listen(0, 80);
   peer p;
   auto c = *open_passive(*l, 80, p);
 
-  const bytes a = frames::pattern(100, 7), b = frames::pattern(100, 8);
-  const std::uint32_t first = p.seq;
+  const bytes         stream = frames::pattern(450, 7);
+  const std::uint32_t first  = p.seq;
+  auto at = [&](std::size_t from, std::size_t n)
+  {
+    p.seq = first + std::uint32_t(from);
+    return p.segment(ACK, slice(stream, from, n));
+  };
+
+  // Two segments ahead of a gap: kept, each answered by a duplicate ACK
+  g_tx.clear();
+  deliver({at(200, 100), at(100, 100), at(100, 100)});          // the last one twice
+  auto s = segments();
+  PROTOCOL_CHECK(s.size() == 3);
+  for (const auto& seen : s)
+    PROTOCOL_CHECK(seen.ack == first);
+  PROTOCOL_CHECK(ipv4::tcp::received_length(c) == 0);
+  PROTOCOL_CHECK(ipv4::stats().tcp_rx_out_of_order == 2);
+
+  // The gap filled: everything is received and acknowledged at once
+  g_tx.clear();
+  deliver({at(0, 100)});
+  s = segments();
+  PROTOCOL_CHECK(!s.empty() && s.back().ack == first + 300);
+  PROTOCOL_CHECK(read_all(c) == slice(stream, 0, 300));
+
+  // Overlapping: [350, 450) waits, [300, 400) fills the gap and half of it
+  deliver({at(350, 100), at(300, 100)});
+  PROTOCOL_CHECK(read_all(c) == slice(stream, 300, 150));
+  s = segments();
+  PROTOCOL_CHECK(!s.empty() && s.back().ack == first + 450);
+  PROTOCOL_CHECK(ipv4::stats().tcp_rx_refused == 0);
+
+  ipv4::tcp::close(c);
+  run_step();
+  p.seq = first + 450;
+  p.ack += 1;
+  deliver({p.segment(ACK | FIN)});
+  wait(ipv4::c_tcp_time_wait + 10);
+  PROTOCOL_CHECK(all_blocks_free());
+}
+
+void tcp_out_of_order_fin()
+{
+  setup();
+  auto l = ipv4::tcp::listen(0, 80);
+  peer p;
+  auto c = *open_passive(*l, 80, p);
+
+  const bytes         stream = frames::pattern(200, 9);
+  const std::uint32_t first  = p.seq;
+
+  p.seq = first + 100;
+  deliver({p.segment(ACK | FIN, slice(stream, 100, 100))});   // the end comes first
+  PROTOCOL_CHECK(ipv4::tcp::state(c) == ipv4::tcp::status::established);
 
   g_tx.clear();
-  p.seq = first + 100;
-  deliver({p.segment(ACK, b)});                                // b before a
+  p.seq = first;
+  deliver({p.segment(ACK, slice(stream, 0, 100))});
+  PROTOCOL_CHECK(ipv4::tcp::state(c) == ipv4::tcp::status::peer_closed);
   auto s = segments();
-  PROTOCOL_CHECK(!s.empty() && s.back().ack == first);         // duplicate ACK
-  PROTOCOL_CHECK(ipv4::tcp::received_length(c) == 0);
+  PROTOCOL_CHECK(!s.empty() && s.back().ack == first + 201);   // data and FIN
+  PROTOCOL_CHECK(read_all(c) == stream);
 
+  ipv4::tcp::close(c);
+  run_step();
+  p.seq = first + 201;
+  p.ack += 1;
+  deliver({p.segment(ACK)});
+  PROTOCOL_CHECK(ipv4::tcp::state(c) == ipv4::tcp::status::closed);
+  PROTOCOL_CHECK(all_blocks_free());
+}
+
+/// Blocks kept out of order are given up for data in order
+void tcp_out_of_order_eviction()
+{
+  setup();
+  auto l = ipv4::tcp::listen(0, 80);
+  peer p;
+  auto c = *open_passive(*l, 80, p);
+
+  const bytes         stream = frames::pattern(100 * (ipv4::c_tcp_rx_segments + 1), 3);
+  const std::uint32_t first  = p.seq;
+
+  for (std::size_t i = 1; i <= ipv4::c_tcp_rx_segments; ++i)
+  {
+    p.seq = first + std::uint32_t(100 * i);
+    deliver({p.segment(ACK, slice(stream, 100 * i, 100))});
+  }
+
+  // Every block the connection may take is out of order: the in order
+  // segment still gets in, the one furthest ahead goes
+  g_tx.clear();
   p.seq = first;
-  deliver({p.segment(ACK, a)});
-  p.seq = first;
-  deliver({p.segment(ACK, frames::pattern(150, 7))});          // a again, overlapping, plus 50 new
-  PROTOCOL_CHECK(ipv4::tcp::received_length(c) == 150);
-  std::uint8_t buffer[150];
-  ipv4::tcp::receive(c, buffer, 150);
-  PROTOCOL_CHECK(bytes(buffer, buffer + 150) == frames::pattern(150, 7));
+  deliver({p.segment(ACK, slice(stream, 0, 100))});
+  const auto s = segments();
+  PROTOCOL_CHECK(!s.empty());
+  const std::uint32_t acked = s.back().ack - first;
+  PROTOCOL_CHECK(acked >= 100 && acked < stream.size() && acked % 100 == 0);
+  PROTOCOL_CHECK(read_all(c) == slice(stream, 0, acked));
+  PROTOCOL_CHECK(ipv4::stats().tcp_rx_refused == 0);
+
+  ipv4::tcp::abort(c);
+  run_step();
+  PROTOCOL_CHECK(all_blocks_free());
 }
 
 void tcp_backlog_and_table_limits()
@@ -620,7 +754,10 @@ const test_case g_cases[] =
   {"tcp_zero_window_probe",          tcp_zero_window_probe},
   {"tcp_peer_closes_first",          tcp_peer_closes_first},
   {"tcp_we_close_first",             tcp_we_close_first},
-  {"tcp_out_of_order_dropped",       tcp_out_of_order_dropped},
+  {"tcp_early_retransmit",           tcp_early_retransmit},
+  {"tcp_out_of_order_reassembly",    tcp_out_of_order_reassembly},
+  {"tcp_out_of_order_fin",           tcp_out_of_order_fin},
+  {"tcp_out_of_order_eviction",      tcp_out_of_order_eviction},
   {"tcp_backlog_and_table_limits",   tcp_backlog_and_table_limits},
   {"tcp_active_open_with_arp",       tcp_active_open_with_arp},
   {"tcp_connect_host_never_answers", tcp_connect_host_never_answers},

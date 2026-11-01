@@ -66,7 +66,10 @@ protocol_cases(protocol_test_tcp test_tcp.cpp
   tcp_zero_window_probe
   tcp_peer_closes_first
   tcp_we_close_first
-  tcp_out_of_order_dropped
+  tcp_early_retransmit
+  tcp_out_of_order_reassembly
+  tcp_out_of_order_fin
+  tcp_out_of_order_eviction
   tcp_backlog_and_table_limits
   tcp_active_open_with_arp
   tcp_connect_host_never_answers
@@ -80,7 +83,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(protocol_test_tcp_interop test_tcp_interop.cpp)
   target_link_libraries(protocol_test_tcp_interop PRIVATE protocol::ipv4 protocol_warnings Threads::Threads)
   foreach(name tcp_server_echo_stream tcp_server_echo_lossy tcp_three_listeners
-               tcp_client_stream tcp_refused_and_reset)
+               tcp_client_stream tcp_client_upload_lossy tcp_refused_and_reset)
     add_test(NAME ${name} COMMAND protocol_test_tcp_interop ${name})
     set_tests_properties(${name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   endforeach()

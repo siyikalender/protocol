@@ -484,8 +484,10 @@ void server_echo_lossy(tap& t)
   st.run([&] { server.listeners.push_back(*ipv4::tcp::listen(0, 7000)); });
   st.every_step([&] { server.step(); });
 
-  PROTOCOL_CHECK(echo_round_trip(t.stack_ip, 7000, 512 * 1024, 2));
-  std::printf("frames dropped: %zu\n", st.frames_dropped());
+  double mbps = 0;
+  PROTOCOL_CHECK(echo_round_trip(t.stack_ip, 7000, 512 * 1024, 2, &mbps));
+  std::printf("echo of 512 KB, 3 %% lost: %.1f Mbit/s each way; frames dropped: %zu\n",
+              mbps, st.frames_dropped());
 
   ipv4::statistics s{};
   st.run([&] { s = ipv4::stats(); });
@@ -590,6 +592,63 @@ void client_stream(tap& t)
   PROTOCOL_CHECK(no_leak(st));
 }
 
+/// One way, lossy: the stack sends, the kernel only acknowledges, so the
+/// stack's own loss recovery (duplicate ACKs, NewReno, timeouts) is measured
+void client_upload_lossy(tap& t)
+{
+  stack_thread st(t, 0.03);
+
+  const int l = kernel_socket();
+  const int one = 1;
+  ::setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  const sockaddr_in a = socket_address(t.host_ip, 7300);
+  PROTOCOL_CHECK(::bind(l, reinterpret_cast<const sockaddr*>(&a), sizeof a) == 0);
+  ::listen(l, 1);
+
+  const bytes up = random_bytes(512 * 1024, 5);
+
+  std::optional<ipv4::tcp::connection> c;
+  st.run([&] { c = ipv4::tcp::connect(0, {to_address(t.host_ip), 7300}); });
+  PROTOCOL_CHECK(c.has_value());
+  if (!c) return;
+
+  std::size_t       sent = 0;
+  std::atomic<bool> closed{false};
+  st.every_step([&]
+  {
+    if (ipv4::tcp::state(*c) == ipv4::tcp::status::connecting)
+      return;
+    if (sent < up.size())
+      sent += ipv4::tcp::send(*c, up.data() + sent, up.size() - sent);
+    else if (!closed)
+    {
+      ipv4::tcp::close(*c);
+      closed = true;
+    }
+  });
+
+  const int s = ::accept(l, nullptr, nullptr);
+  PROTOCOL_CHECK(s >= 0);
+  timeval tv{20, 0};
+  ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+  const auto start    = std::chrono::steady_clock::now();
+  const bytes received = receive_all(s, up.size() + 1);
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  PROTOCOL_CHECK(received == up);
+
+  ipv4::statistics st_now{};
+  st.run([&] { st_now = ipv4::stats(); });
+  std::printf("upload of 512 KB, 3 %% lost: %.1f Mbit/s; frames dropped: %zu, retransmitted: %u\n",
+              up.size() * 8 / seconds / 1e6, st.frames_dropped(), st_now.tcp_retransmits);
+
+  PROTOCOL_CHECK(wait_until([&] { return closed.load(); }));
+  ::close(s);
+  ::close(l);
+  st.every_step(nullptr);
+  PROTOCOL_CHECK(no_leak(st));
+}
+
 void refused_and_reset(tap& t)
 {
   stack_thread st(t);
@@ -645,6 +704,7 @@ const test_case g_cases[] =
   {"tcp_server_echo_lossy",  server_echo_lossy},
   {"tcp_three_listeners",    three_listeners},
   {"tcp_client_stream",      client_stream},
+  {"tcp_client_upload_lossy", client_upload_lossy},
   {"tcp_refused_and_reset",  refused_and_reset},
 };
 
