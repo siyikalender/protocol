@@ -67,6 +67,8 @@ protocol_cases(protocol_test_tcp test_tcp.cpp
   tcp_peer_closes_first
   tcp_we_close_first
   tcp_early_retransmit
+  tcp_sack_receiver
+  tcp_sack_sender
   tcp_out_of_order_reassembly
   tcp_out_of_order_fin
   tcp_out_of_order_eviction

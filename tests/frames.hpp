@@ -236,6 +236,8 @@ struct tcp_options
 {
   std::uint16_t window = 8192;
   std::uint16_t mss    = 0;      ///< 0: no MSS option
+  bool          sack_permitted = false;
+  std::vector<std::uint32_t> sack{};   ///< SACK blocks: left, right, ...
 };
 
 /// A TCP segment from host h
@@ -243,14 +245,23 @@ inline bytes tcp_frame(std::uint8_t h, std::uint16_t sport, std::uint16_t dport,
                        std::uint32_t seq, std::uint32_t ack, std::uint8_t flags,
                        const bytes& data = {}, tcp_options o = {})
 {
-  const std::size_t hl = o.mss ? 24 : 20;
+  bytes opts;
+  if (o.mss) { opts.insert(opts.end(), {2, 4, std::uint8_t(o.mss >> 8), std::uint8_t(o.mss)}); }
+  if (o.sack_permitted) { opts.insert(opts.end(), {1, 1, 4, 2}); }
+  if (!o.sack.empty())
+  {
+    opts.insert(opts.end(), {1, 1, 5, std::uint8_t(2 + 4 * o.sack.size())});
+    for (std::uint32_t e : o.sack)
+      opts.insert(opts.end(), {std::uint8_t(e >> 24), std::uint8_t(e >> 16), std::uint8_t(e >> 8), std::uint8_t(e)});
+  }
+  const std::size_t hl = 20 + opts.size();
   bytes t(hl + data.size(), 0);
+  std::copy(opts.begin(), opts.end(), t.begin() + 20);
   put16(t, 0, sport); put16(t, 2, dport);
   put16(t, 4, std::uint16_t(seq >> 16)); put16(t, 6, std::uint16_t(seq));
   put16(t, 8, std::uint16_t(ack >> 16)); put16(t, 10, std::uint16_t(ack));
   t[12] = std::uint8_t((hl / 4) << 4); t[13] = flags;
   put16(t, 14, o.window);
-  if (o.mss) { t[20] = 2; t[21] = 4; put16(t, 22, o.mss); }
   std::copy(data.begin(), data.end(), t.begin() + std::ptrdiff_t(hl));
   put16(t, 16, fold(sum16(t.data(), t.size(), pseudo(host_ip(h), stack_ip, 6, t.size()))));
   return ipv4_frame(h, 6, t);
@@ -264,6 +275,8 @@ struct tcp_seen
   std::uint8_t  flags = 0;
   bytes         data;
   bool          checksum_ok = false;
+  bool          sack_permitted = false;
+  std::vector<std::uint32_t> sack;     ///< SACK blocks: left, right, ...
 };
 
 inline std::optional<tcp_seen> parse_tcp(const bytes& f)
@@ -279,8 +292,20 @@ inline std::optional<tcp_seen> parse_tcp(const bytes& f)
   const std::size_t hl = (f[46] >> 4) * 4U;
   s.flags  = f[47];
   s.window = get16(f, 48);
-  if (hl >= 24 && f[54] == 2 && f[55] == 4)
-    s.mss = get16(f, 56);
+  for (std::size_t i = 54; i < 34 + hl;)
+  {
+    const std::uint8_t kind = f[i];
+    if (kind == 0) break;
+    if (kind == 1) { ++i; continue; }
+    const std::uint8_t len = f[i + 1];
+    if (len < 2) break;
+    if (kind == 2 && len == 4) s.mss = get16(f, i + 2);
+    if (kind == 4 && len == 2) s.sack_permitted = true;
+    if (kind == 5)
+      for (std::size_t j = i + 2; j + 4 <= i + len; j += 4)
+        s.sack.push_back((std::uint32_t(get16(f, j)) << 16) | get16(f, j + 2));
+    i += len;
+  }
   s.data.assign(f.begin() + std::ptrdiff_t(34 + hl), f.begin() + std::ptrdiff_t(14 + total));
   protocol::ipv4::address src{f[26], f[27], f[28], f[29]}, dst{f[30], f[31], f[32], f[33]};
   s.checksum_ok = fold(sum16(&f[34], tl, pseudo(src, dst, 6, tl))) == 0;

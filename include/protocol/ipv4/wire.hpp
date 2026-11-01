@@ -245,6 +245,10 @@ namespace tcp
   constexpr std::uint8_t option_nop        = 1;
   constexpr std::uint8_t option_mss        = 2;
   constexpr std::size_t  option_mss_size   = 4;
+  constexpr std::uint8_t option_sack_permitted      = 4;   // RFC 2018
+  constexpr std::size_t  option_sack_permitted_size = 2;
+  constexpr std::uint8_t option_sack                = 5;
+  constexpr std::size_t  max_sack_blocks            = 4;   // 40 bytes of options
 }
 
 // ---- ICMP -----------------------------------------------------------------

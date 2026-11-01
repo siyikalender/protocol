@@ -71,16 +71,20 @@ for (;;)
 - Loss recovery: fast retransmit on duplicate ACKs (RFC 5681), fewer of
   them when only a few segments are out (early retransmit, RFC 5827), the
   next hole sent at once on a partial ACK (NewReno, RFC 6582).
+- SACK (RFC 2018) when the peer offers it: the stack's ACKs tell which
+  segments it keeps out of order; the peer's SACK blocks mark the sent
+  segments it has, so only the holes are sent again, as soon as enough
+  after them has arrived (RFC 6675), even when the peer's ACKs carry data.
 - Segments received out of order are kept in their blocks until the gap is
   filled (they share the `PROTOCOL_IPV4_TCP_RX_SEGMENTS` blocks with data in
   order, and give them up to it); each is answered by a duplicate ACK
   without data.
 - Sent segments stay in their pool blocks until acknowledged and are sent
   again from there: no send buffer, no copy.
-- Not done: congestion control (RFC 5681), window scaling, SACK,
-  timestamps. Without SACK, a peer that sends data while acknowledging
-  (both directions busy) gives no duplicate ACKs, so a loss there waits
-  for the retransmission timer.
+- Not done: congestion control (RFC 5681), window scaling, timestamps,
+  tail loss probes (a loss among the last segments waits for the
+  retransmission timer). Data segments carry no SACK blocks, only ACKs
+  without data do.
 
 ### DMA drivers
 

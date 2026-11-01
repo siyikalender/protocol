@@ -109,6 +109,9 @@ bool all_blocks_free()
   return ipv4::g_packet_pool.available() == ipv4::c_packet_pool_size;
 }
 
+bytes slice(const bytes& stream, std::size_t from, std::size_t n);
+bytes read_all(ipv4::tcp::connection c);
+
 /// The far end of a connection, written by hand
 struct peer
 {
@@ -118,20 +121,22 @@ struct peer
   std::uint32_t seq   = 5000;   ///< next sequence number we send
   std::uint32_t ack   = 0;      ///< next sequence number we expect
 
-  bytes segment(std::uint8_t flags, const bytes& data = {}, std::uint16_t window = 8192)
+  bytes segment(std::uint8_t flags, const bytes& data = {}, std::uint16_t window = 8192,
+                std::vector<std::uint32_t> sack = {})
   {
-    bytes f = tcp_frame(host, port, local, seq, ack, flags, data, {window, 0});
+    bytes f = tcp_frame(host, port, local, seq, ack, flags, data, {window, 0, false, std::move(sack)});
     seq += std::uint32_t(data.size()) + ((flags & (SYN | FIN)) ? 1U : 0U);
     return f;
   }
 };
 
 /// The handshake with a listener on port; the connection accepted
-std::optional<ipv4::tcp::connection> open_passive(ipv4::tcp::listener l, std::uint16_t port, peer& p)
+std::optional<ipv4::tcp::connection> open_passive(ipv4::tcp::listener l, std::uint16_t port, peer& p,
+                                                  bool sack = false)
 {
   p.local = port;
   g_tx.clear();
-  deliver({tcp_frame(p.host, p.port, port, p.seq, 0, SYN, {}, {8192, 1460})});
+  deliver({tcp_frame(p.host, p.port, port, p.seq, 0, SYN, {}, {8192, 1460, sack})});
   p.seq += 1;
 
   auto s = segments();
@@ -140,6 +145,7 @@ std::optional<ipv4::tcp::connection> open_passive(ipv4::tcp::listener l, std::ui
   PROTOCOL_CHECK(s[0].flags == (SYN | ACK));
   PROTOCOL_CHECK(s[0].ack == p.seq);
   PROTOCOL_CHECK(s[0].mss == 1460);
+  PROTOCOL_CHECK(s[0].sack_permitted == sack);   // only when offered
   PROTOCOL_CHECK(s[0].window > 0);
   PROTOCOL_CHECK(s[0].checksum_ok);
   p.ack = s[0].seq + 1;
@@ -346,6 +352,78 @@ void tcp_early_retransmit()
   deliver({p.segment(ACK)});
   auto s = segments();
   PROTOCOL_CHECK(s.size() == 1 && s[0].seq == p.ack && s[0].data.size() == 1460);
+  PROTOCOL_CHECK(ipv4::stats().tcp_retransmits == 1);
+}
+
+/// SACK (RFC 2018): the stack tells which segments it keeps out of order
+void tcp_sack_receiver()
+{
+  setup();
+  auto l = ipv4::tcp::listen(0, 80);
+  peer p;
+  auto c = *open_passive(*l, 80, p, true);
+
+  const bytes         stream = frames::pattern(400, 5);
+  const std::uint32_t first  = p.seq;
+  auto at = [&](std::size_t from, std::size_t n)
+  {
+    p.seq = first + std::uint32_t(from);
+    return p.segment(ACK, slice(stream, from, n));
+  };
+
+  g_tx.clear();
+  deliver({at(300, 100)});
+  deliver({at(100, 100)});
+  auto s = segments();
+  PROTOCOL_CHECK(s.size() == 2);
+  if (s.size() != 2) return;
+  PROTOCOL_CHECK(s[0].ack == first && s[0].data.empty());
+  PROTOCOL_CHECK((s[0].sack == std::vector<std::uint32_t>{first + 300, first + 400}));
+  // The latest first, then the others
+  PROTOCOL_CHECK((s[1].sack == std::vector<std::uint32_t>{first + 100, first + 200, first + 300, first + 400}));
+
+  g_tx.clear();
+  deliver({at(0, 100)});        // [0, 200) now; [300, 400) still waits
+  s = segments();
+  PROTOCOL_CHECK(!s.empty() && s.back().ack == first + 200);
+  PROTOCOL_CHECK((s.back().sack == std::vector<std::uint32_t>{first + 300, first + 400}));
+
+  g_tx.clear();
+  deliver({at(200, 100)});
+  s = segments();
+  PROTOCOL_CHECK(!s.empty() && s.back().ack == first + 400 && s.back().sack.empty());
+  PROTOCOL_CHECK(read_all(c) == stream);
+}
+
+/// SACK (RFC 2018, RFC 6675): what the peer has is not sent again; a hole
+/// is, as soon as enough after it has arrived, even told in one ACK
+void tcp_sack_sender()
+{
+  setup();
+  auto l = ipv4::tcp::listen(0, 80);
+  peer p;
+  auto c = *open_passive(*l, 80, p, true);
+
+  const bytes out = frames::pattern(4000, 4);          // 1460, 1460, 1080
+  ipv4::tcp::send(c, out.data(), out.size());
+  run_step(); run_step(); run_step();
+  const std::uint32_t a = p.ack, b = a + 1460, e = a + 4000;
+
+  // One ACK (with data of its own) tells the 2nd and 3rd arrived
+  g_tx.clear();
+  deliver({p.segment(ACK, frames::pattern(10, 1), 8192, {b, e})});
+  auto s = segments();
+  PROTOCOL_CHECK(!s.empty() && s.front().seq == a && s.front().data.size() == 1460);
+  for (const auto& seen : s)
+    PROTOCOL_CHECK(seen.data.empty() || seen.seq == a);
+  PROTOCOL_CHECK(ipv4::stats().tcp_retransmits == 1);
+
+  // Everything acknowledged: nothing more goes
+  g_tx.clear();
+  p.ack = e;
+  deliver({p.segment(ACK)});
+  wait(ipv4::c_tcp_rto_initial * 2);
+  PROTOCOL_CHECK(segments().empty());
   PROTOCOL_CHECK(ipv4::stats().tcp_retransmits == 1);
 }
 
@@ -755,6 +833,8 @@ const test_case g_cases[] =
   {"tcp_peer_closes_first",          tcp_peer_closes_first},
   {"tcp_we_close_first",             tcp_we_close_first},
   {"tcp_early_retransmit",           tcp_early_retransmit},
+  {"tcp_sack_receiver",              tcp_sack_receiver},
+  {"tcp_sack_sender",                tcp_sack_sender},
   {"tcp_out_of_order_reassembly",    tcp_out_of_order_reassembly},
   {"tcp_out_of_order_fin",           tcp_out_of_order_fin},
   {"tcp_out_of_order_eviction",      tcp_out_of_order_eviction},

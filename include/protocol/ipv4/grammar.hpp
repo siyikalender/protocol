@@ -212,14 +212,18 @@ struct tcp_header
   std::uint16_t window            = 0;
   std::uint16_t checksum          = 0;
   std::uint16_t mss               = 0;    ///< the MSS option, 0 when absent
+  bool          sack_permitted    = false;
+  std::uint8_t  sack_blocks       = 0;    ///< SACK blocks: left and right edges
+  std::uint32_t sack[2 * wire::tcp::max_sack_blocks]{};
 
   constexpr std::size_t header_length() const { return data_offset * 4U; }
 
   constexpr wire::tcp::control_t flags() const { return wire::tcp::control_t(control); }
 };
 
-/// A TCP header with its options; of the options only the MSS is kept. The
-/// data offset is for the caller to check against the segment.
+/// A TCP header with its options; of the options MSS, SACK-permitted and
+/// SACK are kept. The data offset is for the caller to check against the
+/// segment.
 template<typename Range>
 constexpr bool parse_tcp_header(const Range& segment, tcp_header& out)
 {
@@ -235,7 +239,15 @@ constexpr bool parse_tcp_header(const Range& segment, tcp_header& out)
     options       = static_cast<int>(t.data_offset) * 4 - static_cast<int>(wire::tcp::min_size);
   };
 
-  // Kind, length, value; the only option kept is MSS (kind 2, length 4)
+  const auto read32 = [](auto v)
+  {
+    std::uint32_t x = 0;
+    for (int i = 0; i < 4; ++i, ++v)
+      x = (x << 8) | static_cast<std::uint8_t>(*v);
+    return x;
+  };
+
+  // Kind, length, value
   const auto read_options = [&](auto first, auto last)
   {
     while (first != last)
@@ -258,6 +270,19 @@ constexpr bool parse_tcp_header(const Range& segment, tcp_header& out)
         const auto high = static_cast<std::uint8_t>(*v);
         ++v;
         t.mss = static_cast<std::uint16_t>((high << 8) | static_cast<std::uint8_t>(*v));
+      }
+      else if (kind == wire::tcp::option_sack_permitted && length == wire::tcp::option_sack_permitted_size)
+      {
+        t.sack_permitted = true;
+      }
+      else if (kind == wire::tcp::option_sack && (length - 2) % 8 == 0 &&
+               (length - 2) / 8 <= static_cast<int>(wire::tcp::max_sack_blocks))
+      {
+        auto v = first;
+        ++v;
+        t.sack_blocks = static_cast<std::uint8_t>((length - 2) / 8);
+        for (std::size_t i = 0; i < 2U * t.sack_blocks; ++i, std::advance(v, 4))
+          t.sack[i] = read32(v);
       }
       std::advance(first, length - 1);
     }

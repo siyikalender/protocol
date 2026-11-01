@@ -98,7 +98,10 @@ struct seg_syn            : bit::field<0> {};
 struct seg_fin            : bit::field<1> {};
 struct seg_sent           : bit::field<2> {};
 struct seg_retransmitted  : bit::field<3> {};
-using  seg_flags_t = bit::storage<bit::pack<std::uint8_t, seg_syn, seg_fin, seg_sent, seg_retransmitted>>;
+struct seg_sacked         : bit::field<4> {};   ///< the peer has it (RFC 2018)
+struct seg_resent         : bit::field<5> {};   ///< sent again in this recovery
+using  seg_flags_t = bit::storage<bit::pack<std::uint8_t, seg_syn, seg_fin, seg_sent, seg_retransmitted,
+                                            seg_sacked, seg_resent>>;
 
 struct tx_segment
 {
@@ -123,8 +126,9 @@ constexpr std::uint8_t c_no_listener = 0;
 /// Payload offset of a data segment: a frame without TCP options starts at
 /// the headroom, where the DMA wants its alignment
 constexpr std::size_t c_data_offset = c_packet_headroom + eth::size + ip::min_size + wire::tcp::min_size;
-/// A SYN carries the MSS option
-constexpr std::size_t c_syn_offset  = c_data_offset + wire::tcp::option_mss_size;
+/// A SYN carries the MSS and SACK-permitted options (8 bytes with padding)
+constexpr std::size_t c_syn_options = 8;
+constexpr std::size_t c_syn_offset  = c_data_offset + c_syn_options;
 
 static_assert(c_data_offset + c_tcp_mss <= c_packet_block_size);
 
@@ -150,6 +154,7 @@ struct tcb
   endpoint              remote{};
   ethernet::address     remote_hw{};
   bool                  hw_known    = false;
+  bool                  sack_ok     = false;          ///< both ends sent SACK-permitted
 
   // Send sequence variables (3.3.1)
   std::uint32_t         iss = 0, snd_una = 0, snd_nxt = 0, snd_wnd = 0, snd_wl1 = 0, snd_wl2 = 0;
@@ -167,6 +172,7 @@ struct tcb
   /// Out of order, by sequence number; shares the c_tcp_rx_segments blocks
   /// with rx
   haluj::bounded::vector<ooo_segment, c_tcp_rx_segments> ooo;
+  std::uint32_t         ooo_last    = 0;              ///< the latest kept: its SACK block goes first
 
   // Control segments to send
   bool                  ack_now     = false;
@@ -386,14 +392,23 @@ struct segment_fields
   std::uint32_t ack         = 0;
   std::uint8_t  control     = 0;
   std::uint16_t window      = 0;
-  bool          mss_option  = false;
+  bool          syn_options = false;      ///< MSS, and SACK-permitted when sack_permitted
+  bool          sack_permitted = false;
+  std::uint8_t  sack_blocks = 0;
+  const std::uint32_t* sack = nullptr;    ///< left and right edges
 };
+
+constexpr std::size_t sack_option_size(std::size_t blocks)
+{
+  return blocks == 0 ? 0 : 4 + 8 * blocks;     // NOP, NOP, kind, length, edges
+}
 
 /// Puts the TCP, IP and Ethernet headers in front of the block's payload
 void write_segment(packet_id p, const interface& itf, const ethernet::address& hw,
                    const segment_fields& f)
 {
-  const std::size_t header_length = wire::tcp::min_size + (f.mss_option ? wire::tcp::option_mss_size : 0);
+  const std::size_t header_length = wire::tcp::min_size +
+                                    (f.syn_options ? c_syn_options : sack_option_size(f.sack_blocks));
   const std::size_t length        = header_length + g_packet_pool.data(p).size();
 
   // Every segment's data sits at c_data_offset or c_syn_offset: the headers
@@ -414,11 +429,24 @@ void write_segment(packet_id p, const interface& itf, const ethernet::address& h
   store16(t + wire::tcp::checksum, 0);
   store16(t + wire::tcp::urgent,   0);
 
-  if (f.mss_option)
+  if (f.syn_options)
   {
     t[20] = wire::tcp::option_mss;
     t[21] = wire::tcp::option_mss_size;
     store16(t + 22, static_cast<std::uint16_t>(c_tcp_mss));
+    t[24] = wire::tcp::option_nop;
+    t[25] = wire::tcp::option_nop;
+    t[26] = f.sack_permitted ? wire::tcp::option_sack_permitted        : wire::tcp::option_nop;
+    t[27] = f.sack_permitted ? wire::tcp::option_sack_permitted_size   : wire::tcp::option_nop;
+  }
+  else if (f.sack_blocks > 0)
+  {
+    t[20] = wire::tcp::option_nop;
+    t[21] = wire::tcp::option_nop;
+    t[22] = wire::tcp::option_sack;
+    t[23] = static_cast<std::uint8_t>(2 + 8 * f.sack_blocks);
+    for (std::size_t i = 0; i < 2U * f.sack_blocks; ++i)
+      store32(t + 24 + 4 * i, f.sack[i]);
   }
 
   write_ipv4_header(h, itf, f.remote.ip_addr, ip::tcp, length);
@@ -435,15 +463,74 @@ void write_segment(packet_id p, const interface& itf, const ethernet::address& h
   pad(p);
 }
 
+/// SACK blocks of the data kept out of order: the one with the latest
+/// segment first (RFC 2018 4), then the others in order
+struct sack_list
+{
+  std::uint8_t  blocks = 0;
+  std::uint32_t edges[2 * wire::tcp::max_sack_blocks]{};
+};
+
+sack_list sack_of(const tcb& c)
+{
+  sack_list l;
+  if (!c.sack_ok)
+    return l;
+
+  std::uint32_t ranges[2 * c_tcp_rx_segments];
+  std::size_t   n     = 0;
+  std::size_t   first = 0;
+  for (const auto& o : c.ooo)
+  {
+    const std::uint32_t end = o.seq + static_cast<std::uint32_t>(g_packet_pool.data(o.id).size());
+    if (n > 0 && seq_le(o.seq, ranges[2 * n - 1]))
+    {
+      if (seq_gt(end, ranges[2 * n - 1]))
+        ranges[2 * n - 1] = end;
+    }
+    else
+    {
+      ranges[2 * n]     = o.seq;
+      ranges[2 * n + 1] = end;
+      ++n;
+    }
+    if (o.seq == c.ooo_last)
+      first = n - 1;
+  }
+
+  auto add = [&](std::size_t i)
+  {
+    if (l.blocks < wire::tcp::max_sack_blocks && ranges[2 * i] != ranges[2 * i + 1])
+    {
+      l.edges[2 * l.blocks]     = ranges[2 * i];
+      l.edges[2 * l.blocks + 1] = ranges[2 * i + 1];
+      ++l.blocks;
+    }
+  };
+  if (n > 0)
+    add(first);
+  for (std::size_t i = 0; i < n; ++i)
+    if (i != first)
+      add(i);
+  return l;
+}
+
 /// A segment of the connection: its current ACK and window
-void write_segment(tcb& c, packet_id p, std::uint32_t seq, control_t control, bool mss_option)
+void write_segment(tcb& c, packet_id p, std::uint32_t seq, control_t control, bool syn,
+                   const sack_list* sack = nullptr)
 {
   segment_fields f;
-  f.local_port = c.local_port;
-  f.remote     = c.remote;
-  f.seq        = seq;
-  f.control    = control.value();
-  f.mss_option = mss_option;
+  f.local_port     = c.local_port;
+  f.remote         = c.remote;
+  f.seq            = seq;
+  f.control        = control.value();
+  f.syn_options    = syn;
+  f.sack_permitted = c.state == tcp_state::syn_sent || c.sack_ok;   // offered, or answered
+  if (sack != nullptr)
+  {
+    f.sack_blocks = sack->blocks;
+    f.sack        = sack->edges;
+  }
 
   if (control.test<wire::tcp::ACK>())
     f.ack = c.rcv_nxt;
@@ -461,8 +548,11 @@ std::optional<packet_id> control_segment(tcb& c, std::uint32_t seq, control_t co
   if (!p)
     return std::nullopt;
 
-  g_packet_pool.set(*p, c_data_offset, 0);
-  write_segment(c, *p, seq, control, false);
+  // SACK blocks on ACKs while data waits out of order; their room is taken
+  // after the payload offset, the frame starts that much later
+  const sack_list sack = control.test<wire::tcp::RST>() ? sack_list{} : sack_of(c);
+  g_packet_pool.set(*p, c_data_offset + sack_option_size(sack.blocks), 0);
+  write_segment(c, *p, seq, control, false, &sack);
   return p;
 }
 
@@ -491,9 +581,60 @@ void retransmit_first(tcb& c)
 {
   if (c.tx.empty() || !c.tx.front().flags.test<seg_sent>())
     return;
-  c.tx.front().flags.clear<seg_sent>().set<seg_retransmitted>();
+  c.tx.front().flags.clear<seg_sent>().set<seg_retransmitted>().set<seg_resent>();
   c.rtt_timing = false;   // Karn: no RTT sample from a segment sent twice
   ++g_stats.tcp_retransmits;
+}
+
+/// Marks the segments the SACK blocks cover; true when any is new
+bool update_scoreboard(tcb& c, const grammar::tcp_header& th)
+{
+  bool more = false;
+  for (std::size_t b = 0; b < th.sack_blocks; ++b)
+  {
+    const std::uint32_t left = th.sack[2 * b], right = th.sack[2 * b + 1];
+    if (!seq_lt(left, right) || seq_le(right, c.snd_una) || seq_gt(right, c.snd_nxt))
+      continue;               // D-SACK (RFC 2883) or nonsense
+
+    for (auto& s : c.tx)
+    {
+      if (s.flags.test<seg_sent>() && !s.flags.test<seg_sacked>() && s.length > 0 &&
+          seq_ge(s.seq, left) && seq_le(s.seq + s.length, right))
+      {
+        s.flags.set<seg_sacked>();
+        more = true;
+      }
+    }
+  }
+  return more;
+}
+
+/// In recovery: every hole below data the peer has is sent again, once
+/// (RFC 6675 NextSeg; a hole is a whole segment here)
+void resend_holes(tcb& c)
+{
+  std::size_t highest = c.tx.size();
+  for (std::size_t i = c.tx.size(); i-- > 0;)
+  {
+    if (c.tx[i].flags.test<seg_sacked>())
+    {
+      highest = i;
+      break;
+    }
+  }
+  if (highest == c.tx.size())
+    return;
+
+  for (std::size_t i = 0; i < highest; ++i)
+  {
+    tx_segment& s = c.tx[i];
+    if (s.flags.test<seg_sent>() && !s.flags.test<seg_sacked>() && !s.flags.test<seg_resent>())
+    {
+      s.flags.clear<seg_sent>().set<seg_retransmitted>().set<seg_resent>();
+      c.rtt_timing = false;
+      ++g_stats.tcp_retransmits;
+    }
+  }
 }
 
 /// RFC 6298 2.2 / 2.3
@@ -570,7 +711,11 @@ void acknowledge(tcb& c, std::uint32_t ack)
     c.timer_start = g_now;          // RFC 6298 5.3
 
   if (partial)
-    retransmit_first(c);
+  {
+    if (!c.tx.empty() && !c.tx.front().flags.test<seg_resent>())
+      retransmit_first(c);
+    resend_holes(c);
+  }
 }
 
 /// Duplicate ACKs that show a loss: three (RFC 5681), fewer when fewer
@@ -585,7 +730,10 @@ std::uint8_t duplicate_threshold(const tcb& c)
 /// Fast retransmit; recovery lasts until all sent now is acknowledged
 void enter_recovery(tcb& c)
 {
+  for (auto& s : c.tx)
+    s.flags.clear<seg_resent>();
   retransmit_first(c);
+  resend_holes(c);
   c.in_recovery = true;
   c.recover     = c.snd_nxt;
 }
@@ -733,6 +881,7 @@ stored store_out_of_order(tcb& c, packet_id p, std::uint32_t seq, bool fin)
     evict_out_of_order(c);
   }
 
+  c.ooo_last = seq;
   c.ooo.push_back({p, seq, fin});
   for (std::size_t j = c.ooo.size() - 1; j > at; --j)
     c.ooo[j] = c.ooo[j - 1];
@@ -852,6 +1001,7 @@ verdict passive_open(interface_designator id, listener_slot& l, packet_id p,
   c->snd_wl1    = th.sequence;
   if (th.mss != 0)
     c->snd_mss  = th.mss;
+  c->sack_ok    = th.sack_permitted;
 
   queue_control(*c, p, true);   // SYN,ACK; data in the SYN is not kept
   return verdict::keep;
@@ -872,17 +1022,36 @@ bool process_ack(tcb& c, const grammar::tcp_header& th, std::uint32_t seg_len)
     return false;
   }
 
+  const std::uint32_t una = c.snd_una;
   if (seq_gt(ack, c.snd_una))
-  {
     acknowledge(c, ack);
-  }
-  else if (ack == c.snd_una && seg_len == 0 && th.window == c.snd_wnd && c.snd_una != c.snd_nxt)
+
+  // An ACK with new SACK information counts as a duplicate even when it
+  // carries data or a new window (RFC 6675 2)
+  const bool sacked_more = c.sack_ok && update_scoreboard(c, th);
+
+  if (ack == una && c.snd_una != c.snd_nxt &&
+      (sacked_more || (seg_len == 0 && th.window == c.snd_wnd)))
   {
     // Duplicate ACK: enough in a row, the first segment was lost
     if (c.dupacks < 0xFF)
       ++c.dupacks;
     if (!c.in_recovery && c.dupacks >= duplicate_threshold(c))
       enter_recovery(c);
+  }
+
+  // The first segment is lost when enough after it have arrived
+  // (RFC 6675 IsLost), however many ACKs told so
+  if (!c.in_recovery && sacked_more)
+  {
+    const auto sacked = std::count_if(c.tx.begin(), c.tx.end(), [](const tx_segment& s)
+                                      { return s.flags.test<seg_sacked>(); });
+    if (sacked >= duplicate_threshold(c))
+      enter_recovery(c);
+  }
+  else if (c.in_recovery && sacked_more)
+  {
+    resend_holes(c);
   }
 
   // Window update
@@ -952,6 +1121,7 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
       c.rcv_adv = c.rcv_nxt;
       if (th.mss != 0)
         c.snd_mss = th.mss;
+      c.sack_ok = th.sack_permitted;
 
       if (ack_ok)
       {
@@ -1169,6 +1339,8 @@ void run_timers(tcb& c)
   }
 
   c.dupacks = 0;
+  for (auto& s : c.tx)
+    s.flags.clear<seg_sacked>();    // RFC 2018 8: the peer may have dropped them
   enter_recovery(c);      // RFC 6582: partial ACKs after a timeout too
 }
 
