@@ -32,38 +32,16 @@ For more information, please refer to <http://unlicense.org>
 #ifndef PROTOCOL_IPV4_HPP
 #define PROTOCOL_IPV4_HPP
 
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <type_traits>
+#include <utility>
+
 #include "types.hpp"
 #include "defs.hpp"
-
-#ifndef DEBUG
-
-#include "builtin.h"
-
-#define ntohs(inval) BSWAP16(inval)
-#define htons(inval) BSWAP16(inval)
-
-#define ntohl(inval) BSWAP32(inval)
-#define htonl(inval) BSWAP32(inval)
-
-#else
-
-inline uint16_t ntohs(uint16_t   p_value)
-{
-  uint8_t *ptr = reinterpret_cast<uint8_t*>(&p_value);
-  uint8_t tmp  = ptr[0];
-  ptr[0] = ptr[1];
-  ptr[1] = tmp;
-  return p_value;
-}
-
-inline uint16_t htons(uint16_t   p_value)
-{
-  return ntohs(p_value);
-}
-
-#define TRACE(P) std::cout<<P
-
-#endif
 
 namespace protocol
 {
@@ -72,220 +50,221 @@ namespace ipv4
 {
 
 extern interface_container        g_interfaces;
-extern arp_table_type             g_arp_table; 
-extern udp_ports_table_type       g_udp_ports; 
-extern std::size_t                g_ip_identification;
+extern arp_table_type             g_arp_table;
+extern udp_ports_table_type       g_udp_ports;
+extern packet_pool_type           g_packet_pool;
 
-struct checksum
+// ---- driver interface -----------------------------------------------------
+//
+// step() talks to the Ethernet driver (HAL) through three functions, usually
+// lambdas, and optionally a fourth one, a clock.
+
+/// True when a received frame is waiting in the driver
+template<typename F>
+concept rx_available_function =
+  std::invocable<F&> && std::convertible_to<std::invoke_result_t<F&>, bool>;
+
+/// Copies the waiting frame (without FCS) to buffer, at most capacity bytes,
+/// and returns its size, 0 on error. buffer is a std::span<std::uint8_t>:
+/// a lambda written as [](auto& buffer, std::size_t capacity) works with it.
+template<typename F>
+concept read_function =
+  requires(F& f, std::span<std::uint8_t>& buffer, std::size_t capacity)
+  {
+    { f(buffer, capacity) } -> std::convertible_to<std::size_t>;
+  };
+
+/// Sends size bytes of frame. The frame buffer is reused when write returns,
+/// so the driver copies it (to a DMA buffer) or sends it before returning.
+template<typename F>
+concept write_function =
+  requires(F& f, std::span<std::uint8_t>& frame, std::size_t size)
+  {
+    f(frame, size);
+  };
+
+/// A free running counter, e.g. milliseconds since start. Wrapping around is
+/// fine: only differences are used.
+template<typename F>
+concept clock_function =
+  std::invocable<F&> && std::convertible_to<std::invoke_result_t<F&>, std::uint32_t>;
+
+/// step() without a clock counts its own calls instead
+struct no_clock
 {
-  void append(const uint16_t p_value)
-  {
-    sum += p_value;
-  }
-
-  template<typename T>
-  void append(const T *p_ptr, const unsigned p_size_in_bytes)
-  {
-    const uint16_t  *ptr = reinterpret_cast<const uint16_t*>(p_ptr);
-    unsigned  size = p_size_in_bytes >> 1;
-    
-    for (unsigned u = 0; u < size; u++, ptr++)
-    {
-      sum += *ptr;
-    }
-    
-    if ((p_size_in_bytes & 0x01) == 0x01)
-    {
-      sum += *reinterpret_cast<const uint8_t*>(ptr);
-    }
-  }
-  
-  uint16_t finalize()
-  {
-    while(sum >> 16)
-    {
-      sum = (sum >> 16) + (sum & 0xFFFF); 
-    }
-    return ~sum;
-  }
-  
-  unsigned sum = 0U;
+  constexpr std::uint32_t operator()() const { return 0; }
 };
 
-extern void
-process_received_frame
-(
-  interface&  i, 
-  bool        p_soft_address_match,
-  bool        p_allow_broadcast
-);
+// ---- internals used by step() and the inline functions below ---------------
 
-extern void 
-write_udp_packet
-(
-  interface&          i,
-  arp_table_entry&    e, 
-  buffer_descriptor&  bd  
-);
+namespace detail
+{
+  std::uint32_t             count_step();
+  std::optional<packet_id>  acquire_receive_block();
+  std::span<std::uint8_t>   receive_buffer(packet_id p);
+  /// Takes the block. Returns it again when it now holds a reply to send.
+  std::optional<packet_id>  process_received_frame(interface_designator id, packet_id p,
+                                                   std::size_t size);
+  /// The next frame to send on the interface, or none
+  std::optional<packet_id>  next_transmit_frame(interface_designator id, std::uint32_t tick);
+  /// The block was written to the driver: counts and frees it
+  void                      transmitted(packet_id p);
 
-extern void 
-write_arp_packet
-(
-  interface&          i,
-  arp_table_entry&    e,
-  const bool          is_response
-);
+  inline void release(packet_id p)                     { g_packet_pool.release(p); }
+  inline std::span<std::uint8_t> data(packet_id p)     { return g_packet_pool.data(p); }
+} // namespace detail
 
-extern arp_table_entry_ref
-find_arp_entry
-(
-  const address& a
-);
-
+/// Runs the stack once: reads at most one frame per interface and handles
+/// it, then sends what is ready to be sent.
+///
+/// \code {.cpp}
+/// ipv4::step
+/// (
+///   []                                   { return enet_frame_available(); },
+///   [](auto& buffer, std::size_t capacity) { return enet_read(buffer.data(), capacity); },
+///   [](auto& frame,  std::size_t size)     { enet_write(frame.data(), size); },
+///   []                                   { return millis(); }   // optional
+/// );
+/// \endcode
 template
 <
-  typename IsRxAvailableFunction,
-  typename ReadFunction,
-  typename WriteFunction
+  rx_available_function IsRxAvailableFunction,
+  read_function         ReadFunction,
+  write_function        WriteFunction,
+  clock_function        ClockFunction = no_clock
 >
-inline void 
+inline void
 step
 (
   IsRxAvailableFunction   is_rx_available,
   ReadFunction            read,
-  WriteFunction           write
+  WriteFunction           write,
+  ClockFunction           now = {}
 )
 {
-  for(auto &i : g_interfaces)
-  {
-    i.tx_frame_size = 0U;
+  std::uint32_t tick;
 
+  if constexpr (std::same_as<ClockFunction, no_clock>)
+    tick = detail::count_step();
+  else
+    tick = static_cast<std::uint32_t>(now());
+
+  auto transmit = [&write](packet_id p)
+  {
+    std::span<std::uint8_t> frame = detail::data(p);
+    write(frame, frame.size());
+    detail::transmitted(p);
+  };
+
+  for (interface_designator id = 0; id < c_interface_table_size; ++id)
+  {
     if (is_rx_available())
     {
-      i.rx_frame_size = 
-        read
-        (
-          i.rx_frame_buffer, 
-          i.rx_frame_buffer.size()
-        );
-      
-      if (i.rx_frame_size > 0)
+      // No free block: the frame stays in the driver until one is released
+      if (auto block = detail::acquire_receive_block())
       {
-        process_received_frame(i, true, true);
-      }
-      else
-      {
-        TRACE("ERROR ! Packet read\n");
+        std::span<std::uint8_t> buffer = detail::receive_buffer(*block);
+        const std::size_t       size   = read(buffer, buffer.size());
+
+        if (auto reply = detail::process_received_frame(id, *block, size))
+          transmit(*reply);
       }
     }
-    
-    if (i.tx_frame_size > 0u)
-    {
-      // Immediate response for ARP and ICMP are priority
-      // Altough, fixed priority is not the best idea
-      write
-      (
-        i.tx_frame_buffer, 
-        i.tx_frame_size
-      );
-    }
-    else
-    {
-      // No immediate response is required. Process user packets per step (! TO-DO:Check tx busy)
-      TRACE(__FUNCTION__ << ": Process user packets\n");
 
-      for (auto &bd : i.tx_buffer_descriptors)
-      {
-        auto &f = bd.flags;
-        
-        if (f.test<valid>())
-        {
-          TRACE(__FUNCTION__ << ": Process paket\n");
-          
-          switch(bd.ip_protocol)
-          {
-            default:
-              f.clear<valid, pending>();
-              break;
-            case UDP:
-              TRACE(__FUNCTION__ << ": Paket is UDP\n");
-              {
-                auto e_ref = find_arp_entry(bd.remote.ip_addr);
-                
-                if ( e_ref )
-                {
-                  arp_table_entry &e = *e_ref;
-                  
-                  TRACE(__FUNCTION__ << ": Found in ARP Table\n");
-                  
-                  if ( e.is_complete() )
-                  {
-                    TRACE(__FUNCTION__ << ": and ARP entry is complete\n");
-                    
-                    write_udp_packet(i, e, bd);
-                    
-                    f.clear<valid>();
-                  }
-                  else
-                  {
-                    TRACE(__FUNCTION__ << ": ARP entry is incomplete\n");
-                    // TO-DO... while waiting for response
-                    //   retry or remove entry
-                  }
-                }
-                else
-                {
-                  TRACE(__FUNCTION__ << ": Not in ARP table\n");
-
-                  auto r = haluj::bounded::push_back
-                  (
-                    g_arp_table,
-                    arp_table_entry
-                    {
-                      {0xFF, 0xFF, 0XFF, 0xFF, 0xFF, 0XFF},
-                      bd.remote.ip_addr,
-                      false
-                    }
-                  );
-
-                  if (r)
-                  {
-                    write_arp_packet(i, g_arp_table.back(), false);
-                  }
-                }
-              }
-              
-              if (i.tx_frame_size > 0)
-              {
-                write
-                (
-                  i.tx_frame_buffer, 
-                  i.tx_frame_size
-                );
-              }
-
-              break;
-          }
-        }
-      }
-    }
+    while (auto frame = detail::next_transmit_frame(id, tick))
+      transmit(*frame);
   }
 }
 
-extern void 
+/// Clears all tables and queues and frees every packet
+extern void
 initialize();
 
 extern bool
 set
 (
   const interface_designator  id,
-  ethernet::address           hw_addr, 
+  ethernet::address           hw_addr,
   ipv4::address               ip_addr
 );
+
+extern const statistics&
+stats();
+
+/// Owns one block of the packet pool and frees it when destroyed, like a
+/// std::unique_ptr for packets. It can be moved but not copied, so a block
+/// always has exactly one owner and cannot be leaked or freed twice.
+class packet
+{
+public:
+  packet() = default;
+
+  explicit packet(packet_id id) : m_id(id) {}
+
+  packet(packet&& other) noexcept
+  : m_id(std::exchange(other.m_id, std::nullopt))
+  {}
+
+  packet& operator=(packet&& other) noexcept
+  {
+    if (this != &other)
+    {
+      reset();
+      m_id = std::exchange(other.m_id, std::nullopt);
+    }
+    return *this;
+  }
+
+  packet(const packet&)            = delete;
+  packet& operator=(const packet&) = delete;
+
+  ~packet() { reset(); }
+
+  explicit operator bool() const { return m_id.has_value(); }
+
+  /// The payload: received data, or the bytes to fill before sending
+  std::span<std::uint8_t> data() const
+  {
+    return m_id ? detail::data(*m_id) : std::span<std::uint8_t>{};
+  }
+
+  std::size_t size() const { return data().size(); }
+
+  std::optional<packet_id> id() const { return m_id; }
+
+  /// Frees the block now
+  void reset()
+  {
+    if (m_id)
+    {
+      detail::release(*m_id);
+      m_id.reset();
+    }
+  }
+
+  /// Gives up ownership without freeing: the caller frees the block
+  std::optional<packet_id> detach() { return std::exchange(m_id, std::nullopt); }
+
+private:
+  std::optional<packet_id> m_id;
+};
 
 namespace udp
 {
 
+/// A received datagram. The block is freed when the datagram is destroyed,
+/// or it can be moved into send() to answer without copying.
+struct datagram
+{
+  packet    buffer;
+  endpoint  remote;
+
+  std::span<const std::uint8_t> data() const { return buffer.data(); }
+  std::size_t                   size() const { return buffer.size(); }
+};
+
+/// Binds a port on an interface. Fails when the port is already bound or
+/// the table is full.
 extern endpoint_designator
 bind
 (
@@ -293,12 +272,22 @@ bind
   const uint16_t              port
 );
 
-extern std::size_t 
+/// Size of the oldest datagram waiting, 0 when none
+extern std::size_t
 received_length
 (
   const endpoint_designator&  ed
 );
 
+/// Takes the oldest datagram waiting, without copying it
+extern std::optional<datagram>
+receive
+(
+  const endpoint_designator&  ed
+);
+
+/// Copies the oldest datagram waiting into data and frees it. A datagram
+/// longer than size is cut to size bytes.
 extern std::size_t
 receive
 (
@@ -308,6 +297,25 @@ receive
   endpoint&                   remote
 );
 
+/// A packet with size bytes of payload to fill, for send() without copying
+extern std::optional<packet>
+allocate
+(
+  const endpoint_designator&  ed,
+  const std::size_t           size
+);
+
+/// Queues the payload of p for sending. On success the stack owns the
+/// packet; on failure p is left as it was.
+extern bool
+send
+(
+  const endpoint_designator&  ed,
+  packet&&                    p,
+  const endpoint&             remote
+);
+
+/// Copies data into a packet and queues it. Returns size, 0 on failure.
 extern std::size_t
 send
 (
@@ -317,7 +325,7 @@ send
   const endpoint&             remote
 );
 
-} // namespace udp  
+} // namespace udp
 
 } // namespace ipv4
 

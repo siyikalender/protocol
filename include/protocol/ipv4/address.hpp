@@ -32,8 +32,9 @@ For more information, please refer to <http://unlicense.org>
 #ifndef PROTOCOL_IPV4_ADDRESS_HPP
 #define PROTOCOL_IPV4_ADDRESS_HPP
 
-#include <cstdint>
 #include <array>
+#include <bit>
+#include <cstdint>
 
 namespace protocol
 {
@@ -43,9 +44,11 @@ namespace ipv4
 
 typedef std::array<uint8_t, 4> address;
 
-inline uint32_t to_u32(const protocol::ipv4::address& a)
+/// The four bytes as they are in memory, read as one uint32_t. std::bit_cast
+/// copies the bytes, so it is well defined for any alignment of a.
+constexpr uint32_t to_u32(const protocol::ipv4::address& a)
 {
-  return *reinterpret_cast<const uint32_t*>(&a[0]);
+  return std::bit_cast<uint32_t>(a);
 }
   
 } // namespace ipv4

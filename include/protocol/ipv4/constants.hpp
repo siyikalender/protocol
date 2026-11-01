@@ -31,6 +31,7 @@ For more information, please refer to <http://unlicense.org>
 #ifndef PROTOCOL_IPV4_CONSTANTS_HPP
 #define PROTOCOL_IPV4_CONSTANTS_HPP
 
+#include <cstddef>
 #include <cstdint>
 
 namespace protocol
@@ -43,14 +44,55 @@ constexpr uint8_t   ICMP = 0x01;
 constexpr uint8_t   TCP  = 0x06;
 constexpr uint8_t   UDP  = 0x11;
 
-constexpr std::size_t c_min_eth_frame_size      = 60;   // without crc
-constexpr std::size_t c_max_eth_frame_size      = 1518; // without crc
+constexpr std::size_t c_min_eth_frame_size      = 60;   // without FCS
+constexpr std::size_t c_max_eth_frame_size      = 1514; // without FCS, no VLAN tag
+constexpr std::size_t c_max_udp_payload_size    = c_max_eth_frame_size - 14 - 20 - 8; // 1472
+
 constexpr std::size_t c_interface_table_size    = 1;
 constexpr std::size_t c_arp_table_size          = 4;
 constexpr std::size_t c_udp_ports_table_size    = 8;
-constexpr std::size_t c_rx_buffer_size          = 2048U;
-constexpr std::size_t c_tx_buffer_size          = 2048U;
-constexpr std::size_t c_buffer_descriptor_size  = 4U;
+
+/// Packet pool: every frame, received or sent, lives in one block of the
+/// pool. Memory = c_packet_pool_size * c_packet_block_size (+4 bytes each).
+constexpr std::size_t c_packet_pool_size        = 6;
+/// A multiple of 32 (Cortex-M7 cache line) and of 16 (Kinetis ENET receive
+/// buffer size rule), large enough for the headroom plus a full frame
+constexpr std::size_t c_packet_block_size       = 1536;
+constexpr std::size_t c_packet_block_alignment  = 32;
+/// Puts the IP header on a 4 byte boundary
+constexpr std::size_t c_packet_headroom         = 2;
+
+/// Reserves between the two directions:
+///   - a received datagram is queued on its port only when one block for
+///     the next frame plus c_tx_reserved_blocks stay free: ports nobody
+///     reads cannot stop sending, nor make the stack deaf to ARP and ping,
+///   - udp::allocate()/send() leave c_rx_reserved_blocks free: a burst of
+///     sends cannot stop reception (ARP and ping replies are made in the
+///     received block).
+constexpr std::size_t c_tx_reserved_blocks      = 1;
+constexpr std::size_t c_rx_reserved_blocks      = 1;
+static_assert(c_rx_reserved_blocks >= 1, "one block is always needed to read a frame");
+
+/// Datagrams waiting on one bound port until the application reads them
+constexpr std::size_t c_udp_rx_queue_depth      = 2;
+/// Datagrams waiting to be sent (e.g. for an ARP reply)
+constexpr std::size_t c_tx_queue_size           = 4;
+
+/// ARP: a request is repeated after this interval, in the unit of the clock
+/// given to step() (milliseconds suggested) or in calls of step() when step()
+/// has no clock. Datagrams waiting for a host that did not answer
+/// c_arp_max_requests requests are dropped.
+constexpr std::uint32_t c_arp_retry_interval    = 1000;
+constexpr std::uint8_t  c_arp_max_requests      = 3;
+
+/// Checks the IP, ICMP and UDP checksums of received packets in software.
+/// Set to false when the MAC checks them and drops bad frames itself
+/// (checksum offload), so the work is not done twice.
+constexpr bool          c_verify_rx_checksums   = true;
+
+static_assert(c_packet_block_size >= c_packet_headroom + c_max_eth_frame_size);
+static_assert(c_packet_pool_size > c_tx_reserved_blocks + c_rx_reserved_blocks);
+static_assert(c_arp_retry_interval > 0);
 
 } // namespace ipv4
 
