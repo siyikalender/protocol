@@ -139,6 +139,9 @@ struct statistics
   uint32_t tx_arp_timeout       = 0;  ///< dropped, the host never answered
   uint32_t tx_busy              = 0;  ///< step_dma(): the driver refused a frame
   uint32_t tx_reply_dropped     = 0;  ///< step_dma(): a reply found no room to wait
+  uint32_t tcp_retransmits      = 0;  ///< TCP segments sent again
+  uint32_t tcp_rx_refused       = 0;  ///< TCP data dropped: out of order, no room
+  uint32_t tcp_resets_sent      = 0;
 };
 
 typedef std::array<interface, c_interface_table_size>                   interface_container;

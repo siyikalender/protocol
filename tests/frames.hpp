@@ -227,6 +227,66 @@ inline bytes udp_payload(const bytes& f)
   return bytes(f.begin() + 42, f.begin() + 42 + std::ptrdiff_t(len - 8));
 }
 
+// ---- TCP --------------------------------------------------------------------
+
+// TCP control bits
+constexpr std::uint8_t FIN = 0x01, SYN = 0x02, RST = 0x04, PSH = 0x08, ACK = 0x10;
+
+struct tcp_options
+{
+  std::uint16_t window = 8192;
+  std::uint16_t mss    = 0;      ///< 0: no MSS option
+};
+
+/// A TCP segment from host h
+inline bytes tcp_frame(std::uint8_t h, std::uint16_t sport, std::uint16_t dport,
+                       std::uint32_t seq, std::uint32_t ack, std::uint8_t flags,
+                       const bytes& data = {}, tcp_options o = {})
+{
+  const std::size_t hl = o.mss ? 24 : 20;
+  bytes t(hl + data.size(), 0);
+  put16(t, 0, sport); put16(t, 2, dport);
+  put16(t, 4, std::uint16_t(seq >> 16)); put16(t, 6, std::uint16_t(seq));
+  put16(t, 8, std::uint16_t(ack >> 16)); put16(t, 10, std::uint16_t(ack));
+  t[12] = std::uint8_t((hl / 4) << 4); t[13] = flags;
+  put16(t, 14, o.window);
+  if (o.mss) { t[20] = 2; t[21] = 4; put16(t, 22, o.mss); }
+  std::copy(data.begin(), data.end(), t.begin() + std::ptrdiff_t(hl));
+  put16(t, 16, fold(sum16(t.data(), t.size(), pseudo(host_ip(h), stack_ip, 6, t.size()))));
+  return ipv4_frame(h, 6, t);
+}
+
+/// A TCP segment written by the stack (IP header without options)
+struct tcp_seen
+{
+  std::uint16_t sport = 0, dport = 0, window = 0, mss = 0;
+  std::uint32_t seq = 0, ack = 0;
+  std::uint8_t  flags = 0;
+  bytes         data;
+  bool          checksum_ok = false;
+};
+
+inline std::optional<tcp_seen> parse_tcp(const bytes& f)
+{
+  if (!is_ipv4(f, 6) || !ipv4_valid(f))
+    return std::nullopt;
+  const std::size_t total = get16(f, 16), tl = total - 20;
+  tcp_seen s;
+  s.sport  = get16(f, 34);
+  s.dport  = get16(f, 36);
+  s.seq    = (std::uint32_t(get16(f, 38)) << 16) | get16(f, 40);
+  s.ack    = (std::uint32_t(get16(f, 42)) << 16) | get16(f, 44);
+  const std::size_t hl = (f[46] >> 4) * 4U;
+  s.flags  = f[47];
+  s.window = get16(f, 48);
+  if (hl >= 24 && f[54] == 2 && f[55] == 4)
+    s.mss = get16(f, 56);
+  s.data.assign(f.begin() + std::ptrdiff_t(34 + hl), f.begin() + std::ptrdiff_t(14 + total));
+  protocol::ipv4::address src{f[26], f[27], f[28], f[29]}, dst{f[30], f[31], f[32], f[33]};
+  s.checksum_ok = fold(sum16(&f[34], tl, pseudo(src, dst, 6, tl))) == 0;
+  return s;
+}
+
 } // namespace frames
 
 // PROTOCOL_TESTS_FRAMES_HPP

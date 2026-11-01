@@ -36,6 +36,7 @@ For more information, please refer to <http://unlicense.org>
 
 #include "protocol/ipv4/stack.hpp"
 #include "protocol/ipv4/grammar.hpp"
+#include "internal.hpp"
 #include "protocol/ipv4/wire.hpp"
 
 namespace protocol
@@ -58,31 +59,74 @@ interface_container           g_interfaces{};
 arp_table_type                g_arp_table;
 udp_ports_table_type          g_udp_ports;
 
-namespace
+namespace internal
 {
 
 using namespace wire;
 
+statistics        g_stats;
+std::uint32_t     g_now               = 0;
+
+namespace
+{
+
 tx_queue_type     g_tx_queue;
 haluj::ring_buffer<std::array<packet_id, c_tx_waiting_size>> g_tx_waiting;
-statistics        g_stats;
 std::uint16_t     g_ip_identification = 0;
 std::uint32_t     g_lru_clock         = 0;
 std::uint32_t     g_step_counter      = 0;
 
-const ethernet::address c_broadcast_hw{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-const address           c_broadcast_ip{0xFF, 0xFF, 0xFF, 0xFF};
-const address           c_unspecified_ip{0, 0, 0, 0};
+} // namespace
+
+// Bit i: block i is with the driver / held by TCP
+std::uint32_t     g_in_flight         = 0;
+std::uint32_t     g_pinned            = 0;
+
+constexpr std::uint32_t bit(packet_id p) { return std::uint32_t(1) << p.index; }
+
+void emit(packet_id p)
+{
+  g_in_flight |= bit(p);
+}
+
+void sent(packet_id p)
+{
+  g_in_flight &= ~bit(p);
+  if ((g_pinned & bit(p)) == 0)
+    g_packet_pool.release(p);
+}
+
+bool in_flight(packet_id p)
+{
+  return (g_in_flight & bit(p)) != 0;
+}
+
+void pin(packet_id p)
+{
+  g_pinned |= bit(p);
+}
+
+void unpin(packet_id p)
+{
+  g_pinned &= ~bit(p);
+  if ((g_in_flight & bit(p)) == 0)
+    g_packet_pool.release(p);
+}
 
 constexpr std::uint16_t c_dont_fragment =
   ip::flags_fragment_t().set<ip::dont_fragment>().value();
 constexpr std::uint8_t  c_ttl = 128;
+
+namespace
+{
 
 /// Every frame starts at the headroom, so its IP header is at a fixed place
 std::uint8_t* ip_header_of(packet_id p)
 {
   return g_packet_pool.base(p) + c_packet_headroom + eth::size;
 }
+
+} // namespace
 
 std::size_t front_room(packet_id p)
 {
@@ -129,11 +173,22 @@ void touch(arp_table_entry& e)
   e.last_used = ++g_lru_clock;
 }
 
+namespace
+{
+
 bool is_datagram_waiting_for(const address& a)
 {
+  if constexpr (c_tcp_connections > 0)
+  {
+    if (tcp_waiting_for(a))
+      return true;
+  }
+
   return std::any_of(g_tx_queue.begin(), g_tx_queue.end(),
                      [&](const tx_entry& t) { return t.remote.ip_addr == a; });
 }
+
+} // namespace
 
 /// Adds an entry. When the table is full, the least recently used entry
 /// that no datagram waits for is replaced. nullptr when every entry has a
@@ -173,6 +228,9 @@ arp_table_entry* insert_arp_entry
   return victim;
 }
 
+namespace
+{
+
 void erase_arp_entry(std::size_t index)
 {
   g_arp_table[index] = g_arp_table.back();
@@ -191,6 +249,9 @@ void erase_tx_entry(std::size_t index)
 
 void drop_datagrams_waiting_for(const address& a)
 {
+  if constexpr (c_tcp_connections > 0)
+    tcp_arp_failed(a);
+
   for (std::size_t i = g_tx_queue.size(); i-- > 0; )
   {
     if (g_tx_queue[i].remote.ip_addr == a)
@@ -201,6 +262,27 @@ void drop_datagrams_waiting_for(const address& a)
     }
   }
 }
+
+} // namespace
+
+void write_ipv4_header(std::uint8_t* h, const interface& itf, const address& destination,
+                       std::uint8_t protocol, std::size_t payload_length)
+{
+  h[ip::version_ihl] = ip::version_ihl_t().assign<ip::version, 4>().assign<ip::ihl, 5>().value();
+  h[ip::tos]         = 0;
+  store16(h + ip::total_length,   std::uint16_t(ip::min_size + payload_length));
+  store16(h + ip::identification, g_ip_identification++);
+  store16(h + ip::flags_fragment, c_dont_fragment);
+  h[ip::ttl]         = c_ttl;
+  h[ip::protocol]    = protocol;
+  store16(h + ip::checksum, 0);
+  store(h + ip::source,      itf.ip_addr);
+  store(h + ip::destination, destination);
+  store16(h + ip::checksum, internet_checksum().add({h, ip::min_size}).result());
+}
+
+namespace
+{
 
 /// Puts the UDP, IP and Ethernet headers in front of the payload
 void write_udp_frame(const interface& itf, const tx_entry& t, const ethernet::address& hw)
@@ -221,24 +303,19 @@ void write_udp_frame(const interface& itf, const tx_entry& t, const ethernet::ad
     g_packet_pool.set(p, payload_offset, payload.size());
   }
 
+  // The payload sits at payload_offset: the headers always have room
   std::uint8_t* u = g_packet_pool.push_header(p, wire::udp::size);
+  std::uint8_t* h = g_packet_pool.push_header(p, ip::min_size);
+  std::uint8_t* e = g_packet_pool.push_header(p, eth::size);
+  if (u == nullptr || h == nullptr || e == nullptr)
+    return;
+
   store16(u + wire::udp::source_port,      t.source_port);
   store16(u + wire::udp::destination_port, t.remote.port);
   store16(u + wire::udp::length,           std::uint16_t(udp_length));
   store16(u + wire::udp::checksum,         0);
 
-  std::uint8_t* h = g_packet_pool.push_header(p, ip::min_size);
-  h[ip::version_ihl] = ip::version_ihl_t().assign<ip::version, 4>().assign<ip::ihl, 5>().value();
-  h[ip::tos]         = 0;
-  store16(h + ip::total_length,   std::uint16_t(ip::min_size + udp_length));
-  store16(h + ip::identification, g_ip_identification++);
-  store16(h + ip::flags_fragment, c_dont_fragment);
-  h[ip::ttl]         = c_ttl;
-  h[ip::protocol]    = ip::udp;
-  store16(h + ip::checksum, 0);
-  store(h + ip::source,      itf.ip_addr);
-  store(h + ip::destination, t.remote.ip_addr);
-  store16(h + ip::checksum, internet_checksum().add({h, ip::min_size}).result());
+  write_ipv4_header(h, itf, t.remote.ip_addr, ip::udp, udp_length);
 
   // Pseudo header: source and destination addresses, protocol, UDP length
   std::uint16_t c = internet_checksum()
@@ -249,7 +326,7 @@ void write_udp_frame(const interface& itf, const tx_entry& t, const ethernet::ad
                       .result();
   store16(u + wire::udp::checksum, c == 0 ? 0xFFFF : c);
 
-  write_ethernet_header(g_packet_pool.push_header(p, eth::size), hw, itf, eth::type_ipv4);
+  write_ethernet_header(e, hw, itf, eth::type_ipv4);
   pad(p);
 }
 
@@ -273,17 +350,16 @@ void write_arp_request(const interface& itf, packet_id p, const address& target)
   pad(p);
 }
 
+} // namespace
+
 // ---- receive ------------------------------------------------------------------
 
-enum class verdict
-{
-  drop,     ///< free the block
-  keep,     ///< the block was queued on a port
-  reply     ///< the block now holds a reply to send
-};
 
 verdict invalid()     { ++g_stats.rx_invalid;    return verdict::drop; }
 verdict not_for_us()  { ++g_stats.rx_not_for_us; return verdict::drop; }
+
+namespace
+{
 
 verdict process_arp(const interface& itf, packet_id p, std::uint8_t* e)
 {
@@ -477,6 +553,11 @@ verdict process_ipv4(interface_designator id, const interface& itf, packet_id p,
       return process_udp(id, p, h);
     case ip::icmp:
       return unicast ? process_icmp(itf, p, e, h, header_length) : not_for_us();
+    case ip::tcp:
+      if constexpr (c_tcp_connections > 0)
+        return unicast ? tcp_process(id, itf, p, e, h) : not_for_us();
+      else
+        return not_for_us();
     default:
       return not_for_us();
   }
@@ -488,6 +569,10 @@ port_descriptor* port_of(const endpoint_designator& ed)
 }
 
 } // namespace
+
+} // namespace internal
+
+using namespace internal;
 
 // ---- step() internals ---------------------------------------------------------
 
@@ -515,8 +600,10 @@ std::span<std::uint8_t> receive_buffer(packet_id p)
 }
 
 std::optional<packet_id>
-process_received_frame(interface_designator id, packet_id p, std::size_t size)
+process_received_frame(interface_designator id, packet_id p, std::size_t size, std::uint32_t tick)
 {
+  g_now = tick;
+
   ++g_stats.rx_frames;
 
   verdict v = verdict::drop;
@@ -552,6 +639,7 @@ process_received_frame(interface_designator id, packet_id p, std::size_t size)
   switch (v)
   {
     case verdict::reply:
+      emit(p);
       return p;
     case verdict::keep:
       break;
@@ -562,10 +650,11 @@ process_received_frame(interface_designator id, packet_id p, std::size_t size)
   return std::nullopt;
 }
 
-std::optional<packet_id> next_transmit_frame(interface_designator id, std::uint32_t tick)
+namespace
 {
-  if (id >= c_interface_table_size)
-    return std::nullopt;
+
+std::optional<packet_id> next_udp_or_arp_frame(interface_designator id, std::uint32_t tick)
+{
 
   const interface& itf = g_interfaces[id];
 
@@ -635,10 +724,37 @@ std::optional<packet_id> next_transmit_frame(interface_designator id, std::uint3
   return std::nullopt;
 }
 
+} // namespace
+
+std::optional<packet_id> next_transmit_frame(interface_designator id, std::uint32_t tick)
+{
+  if (id >= c_interface_table_size)
+    return std::nullopt;
+
+  g_now = tick;
+  auto frame = next_udp_or_arp_frame(id, tick);
+
+  if constexpr (c_tcp_connections > 0)
+  {
+    if (!frame)
+      frame = tcp_next_frame(id, tick);
+  }
+
+  if (frame)
+    emit(*frame);
+
+  return frame;
+}
+
 void transmitted(packet_id p)
 {
   ++g_stats.tx_frames;
-  g_packet_pool.release(p);
+  sent(p);
+}
+
+void reclaimed(packet_id p)
+{
+  sent(p);
 }
 
 std::optional<packet_id> waiting_frame()
@@ -658,7 +774,7 @@ void keep_waiting_frame(packet_id p)
   if (!g_tx_waiting.try_push(p))
   {
     ++g_stats.tx_reply_dropped;
-    g_packet_pool.release(p);
+    sent(p);
   }
 }
 
@@ -680,6 +796,8 @@ void
 initialize()
 {
   g_packet_pool.reset();
+  g_in_flight = 0;
+  g_pinned    = 0;
   g_arp_table.clear();
   g_udp_ports.clear();
   g_tx_queue.clear();
@@ -688,6 +806,9 @@ initialize()
   g_ip_identification = 0;
   g_lru_clock         = 0;
   g_step_counter      = 0;
+
+  if constexpr (c_tcp_connections > 0)
+    tcp_initialize();
 }
 
 bool

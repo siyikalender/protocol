@@ -57,6 +57,35 @@ protocol_cases(protocol_test_dma test_dma.cpp
   dma_overload_cut_at_ring
   dma_arp_timeout)
 
+protocol_cases(protocol_test_tcp test_tcp.cpp
+  tcp_passive_open_and_data
+  tcp_reset_for_closed_port
+  tcp_rfc5961_challenges
+  tcp_retransmission_and_timeout
+  tcp_fast_retransmit
+  tcp_zero_window_probe
+  tcp_peer_closes_first
+  tcp_we_close_first
+  tcp_out_of_order_dropped
+  tcp_backlog_and_table_limits
+  tcp_active_open_with_arp
+  tcp_connect_host_never_answers
+  tcp_zero_copy_api
+  tcp_dma_in_flight)
+
+# TCP against the Linux stack through a TAP interface: skipped (exit code 77)
+# where the test may not create one (needs CAP_NET_ADMIN)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(Threads REQUIRED)
+  add_executable(protocol_test_tcp_interop test_tcp_interop.cpp)
+  target_link_libraries(protocol_test_tcp_interop PRIVATE protocol::ipv4 protocol_warnings Threads::Threads)
+  foreach(name tcp_server_echo_stream tcp_server_echo_lossy tcp_three_listeners
+               tcp_client_stream tcp_refused_and_reset)
+    add_test(NAME ${name} COMMAND protocol_test_tcp_interop ${name})
+    set_tests_properties(${name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  endforeach()
+endif()
+
 # The example runs as a test too, so it keeps compiling
 add_executable(protocol_example ${PROJECT_SOURCE_DIR}/examples/test/main.cpp)
 target_link_libraries(protocol_example PRIVATE protocol::ipv4)

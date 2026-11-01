@@ -69,6 +69,17 @@ constexpr void store16(std::uint8_t* p, const std::uint16_t v)
   p[1] = static_cast<std::uint8_t>(v);
 }
 
+constexpr std::uint32_t load32(const std::uint8_t* p)
+{
+  return (std::uint32_t(load16(p)) << 16) | load16(p + 2);
+}
+
+constexpr void store32(std::uint8_t* p, const std::uint32_t v)
+{
+  store16(p, static_cast<std::uint16_t>(v >> 16));
+  store16(p + 2, static_cast<std::uint16_t>(v));
+}
+
 /// Reads an address (Ethernet or IPv4), e.g. load<ipv4::address>(p)
 template<typename Address>
 constexpr Address load(const std::uint8_t* p)
@@ -173,6 +184,7 @@ namespace ip
   constexpr std::size_t   min_size        = 20;
 
   constexpr std::uint8_t  icmp            = 0x01;
+  constexpr std::uint8_t  tcp             = 0x06;
   constexpr std::uint8_t  udp             = 0x11;
 
   /// The first byte: version (high nibble) and header length in 32 bit
@@ -198,6 +210,41 @@ namespace udp
   constexpr std::size_t length           = 4;
   constexpr std::size_t checksum         = 6;
   constexpr std::size_t size             = 8;
+}
+
+// ---- TCP (RFC 9293) --------------------------------------------------------
+
+namespace tcp
+{
+  constexpr std::size_t source_port      = 0;
+  constexpr std::size_t destination_port = 2;
+  constexpr std::size_t sequence         = 4;
+  constexpr std::size_t acknowledgment   = 8;
+  constexpr std::size_t offset           = 12;
+  constexpr std::size_t control          = 13;
+  constexpr std::size_t window           = 14;
+  constexpr std::size_t checksum         = 16;
+  constexpr std::size_t urgent           = 18;
+  constexpr std::size_t min_size         = 20;
+
+  /// The byte at offset: header length in 32 bit words (high nibble)
+  struct data_offset : bit::field<4, 7> {};
+  using offset_t = bit::storage<bit::pack<std::uint8_t, data_offset>>;
+
+  /// The control bits at control
+  struct FIN : bit::field<0> {};
+  struct SYN : bit::field<1> {};
+  struct RST : bit::field<2> {};
+  struct PSH : bit::field<3> {};
+  struct ACK : bit::field<4> {};
+  struct URG : bit::field<5> {};
+  using control_t = bit::storage<bit::pack<std::uint8_t, FIN, SYN, RST, PSH, ACK, URG>>;
+
+  /// Options
+  constexpr std::uint8_t option_end        = 0;
+  constexpr std::uint8_t option_nop        = 1;
+  constexpr std::uint8_t option_mss        = 2;
+  constexpr std::size_t  option_mss_size   = 4;
 }
 
 // ---- ICMP -----------------------------------------------------------------

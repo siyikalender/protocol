@@ -1,7 +1,7 @@
 # protocol
 Lightweight communication protocol stacks for embedded applications. 
 
-## IPv4 stack (ARP, ICMP echo, UDP)
+## IPv4 stack (ARP, ICMP echo, UDP, TCP)
 
 No heap. Every frame, received or sent, lives in one block of a fixed size
 packet pool (`include/protocol/ipv4/packet_pool.hpp`); the sizes are set in
@@ -37,6 +37,42 @@ for (;;)
 
 The copying `udp::send(ed, data, size, remote)` and
 `udp::receive(ed, data, size, remote)` are available too.
+
+### TCP
+
+Listening and connecting, byte streams both ways (`include/protocol/ipv4/tcp.hpp`):
+
+```cpp
+auto l = ipv4::tcp::listen(0, 502);
+
+for (;;)
+{
+  ipv4::step(...);                          // with a clock: TCP has timers
+
+  if (auto c = ipv4::tcp::accept(*l))
+    connection = *c;
+
+  std::uint8_t buffer[256];
+  if (auto n = ipv4::tcp::receive(connection, buffer, sizeof buffer))
+    ipv4::tcp::send(connection, buffer, n);
+
+  if (ipv4::tcp::state(connection) == ipv4::tcp::status::peer_closed)
+    ipv4::tcp::close(connection);
+}
+```
+
+`connect(0, {address, port})` opens a connection, `allocate()` /
+`send(c, packet&&)` / `receive(c)` work without copying.
+
+- RFC 9293 state machine, RFC 5961 protection against blind RST and SYN,
+  RFC 6298 retransmission timer, RFC 6528 initial sequence numbers (seed
+  them with `tcp::set_secret()` from an RNG), fast retransmit on three
+  duplicate ACKs, zero window probes, MSS option.
+- Sent segments stay in their pool blocks until acknowledged and are sent
+  again from there: no send buffer, no copy.
+- Not done: reassembly of segments received out of order (they are dropped
+  and the peer sends them again), congestion control (RFC 5681), window
+  scaling, SACK, timestamps. On a LAN these matter little.
 
 ### DMA drivers
 
@@ -96,6 +132,13 @@ compile definitions, seen by the library and the application alike
 | `PROTOCOL_IPV4_PACKET_BLOCK_ALIGNMENT` | 32 |
 | `PROTOCOL_IPV4_VERIFY_RX_CHECKSUMS` | 1 (0 with MAC checksum offload) |
 | `PROTOCOL_IPV4_PACKET_POOL_ATTRIBUTES` | empty (e.g. a section attribute) |
+| `PROTOCOL_IPV4_TCP_CONNECTIONS` | 4 (0 leaves TCP out) |
+| `PROTOCOL_IPV4_TCP_LISTENERS` | 3 |
+| `PROTOCOL_IPV4_TCP_RX_SEGMENTS` | 4 blocks per connection: its receive window |
+| `PROTOCOL_IPV4_TCP_TX_SEGMENTS` | 4 blocks per connection: data sent or to send |
+
+For streaming, give TCP room: e.g. `POOL_SIZE=24`, `TCP_RX_SEGMENTS=8`,
+`TCP_TX_SEGMENTS=8`.
 
 ## Building and testing
 
@@ -108,3 +151,7 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build
 ```
+
+The `tcp_*` interop tests run TCP against the Linux stack through a TAP
+interface. They need `/dev/net/tun` and CAP_NET_ADMIN (e.g. `sudo ctest`),
+and are skipped without them.

@@ -105,7 +105,7 @@ namespace detail
   std::span<std::uint8_t>   receive_buffer(packet_id p);
   /// Takes the block. Returns it again when it now holds a reply to send.
   std::optional<packet_id>  process_received_frame(interface_designator id, packet_id p,
-                                                   std::size_t size);
+                                                   std::size_t size, std::uint32_t tick);
   /// The next frame to send on the interface, or none
   std::optional<packet_id>  next_transmit_frame(interface_designator id, std::uint32_t tick);
   /// The block was written to the driver: counts and frees it
@@ -116,8 +116,10 @@ namespace detail
   void                      pop_waiting_frame();
   /// Keeps the frame for later; drops it (frees the block) when full
   void                      keep_waiting_frame(packet_id p);
-  /// The driver took the block (it frees it after sending)
+  /// The driver took the block (it gives it back through reclaim)
   void                      handed_over(packet_id p);
+  /// step_dma(): the driver gave back a sent block
+  void                      reclaimed(packet_id p);
   void                      refused(packet_id p);
 
   inline void release(packet_id p)                     { g_packet_pool.release(p); }
@@ -176,7 +178,7 @@ step
         std::span<std::uint8_t> buffer = detail::receive_buffer(*block);
         const std::size_t       size   = read(buffer, buffer.size());
 
-        if (auto reply = detail::process_received_frame(id, *block, size))
+        if (auto reply = detail::process_received_frame(id, *block, size, tick))
           transmit(*reply);
       }
     }
@@ -326,7 +328,7 @@ step_dma
     // 1. Sent blocks back to the pool first: they are what the RX ring
     //    is refilled from
     while (auto p = reclaim())
-      dma::release(*p);
+      detail::reclaimed(*p);
 
     // 2. Frames refused earlier go out first, in order
     bool busy = false;
@@ -350,7 +352,7 @@ step_dma
       if (!frame)
         break;
 
-      if (auto reply = detail::process_received_frame(id, frame->id, frame->size))
+      if (auto reply = detail::process_received_frame(id, frame->id, frame->size, tick))
       {
         if (busy || !send(*reply))
         {

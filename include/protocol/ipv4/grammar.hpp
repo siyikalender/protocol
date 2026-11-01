@@ -199,6 +199,89 @@ constexpr bool parse_udp_header(const Range& datagram, udp_header& out)
   return parse(rule, datagram, u, out);
 }
 
+// ---- TCP header (RFC 9293) ----------------------------------------------------------
+
+struct tcp_header
+{
+  std::uint16_t source_port       = 0;
+  std::uint16_t destination_port  = 0;
+  std::uint32_t sequence          = 0;
+  std::uint32_t acknowledgment    = 0;
+  std::uint8_t  data_offset       = 0;    ///< header length in 32 bit words
+  std::uint8_t  control           = 0;    ///< wire::tcp::control_t bits
+  std::uint16_t window            = 0;
+  std::uint16_t checksum          = 0;
+  std::uint16_t mss               = 0;    ///< the MSS option, 0 when absent
+
+  constexpr std::size_t header_length() const { return data_offset * 4U; }
+
+  constexpr wire::tcp::control_t flags() const { return wire::tcp::control_t(control); }
+};
+
+/// A TCP header with its options; of the options only the MSS is kept. The
+/// data offset is for the caller to check against the segment.
+template<typename Range>
+constexpr bool parse_tcp_header(const Range& segment, tcp_header& out)
+{
+  using namespace haluj;
+
+  tcp_header t;
+  int        options = 0;   // bytes of options, from the data offset
+
+  const auto data_offset = [&](auto first, auto)
+  {
+    const wire::tcp::offset_t o(static_cast<std::uint8_t>(*first));
+    t.data_offset = static_cast<std::uint8_t>(o.value_of<wire::tcp::data_offset>());
+    options       = static_cast<int>(t.data_offset) * 4 - static_cast<int>(wire::tcp::min_size);
+  };
+
+  // Kind, length, value; the only option kept is MSS (kind 2, length 4)
+  const auto read_options = [&](auto first, auto last)
+  {
+    while (first != last)
+    {
+      const auto kind = static_cast<std::uint8_t>(*first);
+      if (kind == wire::tcp::option_end)
+        break;
+      ++first;
+      if (kind == wire::tcp::option_nop)
+        continue;
+      if (first == last)
+        break;
+      const auto length = static_cast<std::uint8_t>(*first);
+      if (length < 2 || std::distance(first, last) < length - 1)
+        break;                                          // broken: ignore the rest
+      if (kind == wire::tcp::option_mss && length == wire::tcp::option_mss_size)
+      {
+        auto v = first;
+        ++v;
+        const auto high = static_cast<std::uint8_t>(*v);
+        ++v;
+        t.mss = static_cast<std::uint16_t>((high << 8) | static_cast<std::uint8_t>(*v));
+      }
+      std::advance(first, length - 1);
+    }
+  };
+
+  const auto fixed_part =
+    seq
+    (
+      action(bytes<2>(), store_be(t.source_port)),        // Source Port
+      action(bytes<2>(), store_be(t.destination_port)),   // Destination Port
+      action(bytes<4>(), store_be(t.sequence)),           // Sequence Number
+      action(bytes<4>(), store_be(t.acknowledgment)),     // Acknowledgment Number
+      action(bytes<1>(), data_offset),                    // Data Offset, Reserved
+      action(bytes<1>(), store_be(t.control)),            // Control Bits
+      action(bytes<2>(), store_be(t.window)),             // Window
+      action(bytes<2>(), store_be(t.checksum)),           // Checksum
+      bytes<2>()                                          // Urgent Pointer
+    );
+
+  const auto rule = seq(fixed_part, action(vt(options, anychar()), read_options));  // Options
+
+  return parse(rule, segment, t, out);
+}
+
 // ---- ICMP echo request (RFC 792) -----------------------------------------------
 
 /// An echo request: type 8, code 0, then checksum, identifier, sequence

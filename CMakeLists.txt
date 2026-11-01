@@ -41,7 +41,7 @@ if(NOT TARGET bit::bit)
 endif()
 
 # IPv4 stack: protocol::ipv4
-add_library(protocol_ipv4 STATIC src/protocol/ipv4/stack.cpp)
+add_library(protocol_ipv4 STATIC src/protocol/ipv4/stack.cpp src/protocol/ipv4/tcp.cpp)
 add_library(protocol::ipv4 ALIAS protocol_ipv4)
 
 target_include_directories(protocol_ipv4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

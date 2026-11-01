@@ -69,6 +69,22 @@ constexpr std::size_t c_udp_ports_table_size    = 8;
 #define PROTOCOL_IPV4_PACKET_HEADROOM         2
 #endif
 
+#ifndef PROTOCOL_IPV4_TCP_CONNECTIONS
+#define PROTOCOL_IPV4_TCP_CONNECTIONS         4
+#endif
+
+#ifndef PROTOCOL_IPV4_TCP_LISTENERS
+#define PROTOCOL_IPV4_TCP_LISTENERS           3
+#endif
+
+#ifndef PROTOCOL_IPV4_TCP_RX_SEGMENTS
+#define PROTOCOL_IPV4_TCP_RX_SEGMENTS         4
+#endif
+
+#ifndef PROTOCOL_IPV4_TCP_TX_SEGMENTS
+#define PROTOCOL_IPV4_TCP_TX_SEGMENTS         4
+#endif
+
 #ifndef PROTOCOL_IPV4_VERIFY_RX_CHECKSUMS
 #define PROTOCOL_IPV4_VERIFY_RX_CHECKSUMS     1
 #endif
@@ -118,6 +134,37 @@ constexpr std::uint8_t  c_arp_max_requests      = 3;
 /// (checksum offload), so the work is not done twice.
 constexpr bool          c_verify_rx_checksums   = PROTOCOL_IPV4_VERIFY_RX_CHECKSUMS != 0;
 
+/// TCP. 0 connections leaves TCP out of the build.
+///   c_tcp_connections   connections at a time, accepted and opened together
+///   c_tcp_listeners     ports listened on at a time
+///   c_tcp_backlog       connections a listener holds until accept() takes
+///                       them (handshakes going on included)
+///   c_tcp_rx_segments   blocks a connection keeps received data in: its
+///                       receive window is c_tcp_rx_segments * c_tcp_mss
+///   c_tcp_tx_segments   blocks a connection keeps data to send and data sent
+///                       but not yet acknowledged in
+constexpr std::size_t   c_tcp_connections       = PROTOCOL_IPV4_TCP_CONNECTIONS;
+constexpr std::size_t   c_tcp_listeners         = PROTOCOL_IPV4_TCP_LISTENERS;
+constexpr std::size_t   c_tcp_backlog           = 2;
+constexpr std::size_t   c_tcp_rx_segments       = PROTOCOL_IPV4_TCP_RX_SEGMENTS;
+constexpr std::size_t   c_tcp_tx_segments       = PROTOCOL_IPV4_TCP_TX_SEGMENTS;
+/// Largest segment sent or announced: a full Ethernet frame
+constexpr std::size_t   c_tcp_mss               = c_max_eth_frame_size - 14 - 20 - 20;  // 1460
+
+/// TCP timers, in the unit of the clock given to step() (milliseconds), or
+/// in calls of step() without a clock. RFC 6298 asks for a minimum RTO of
+/// 1 s; on a LAN 200 ms (as Linux) recovers much faster.
+constexpr std::uint32_t c_tcp_rto_initial       = 1000;
+constexpr std::uint32_t c_tcp_rto_min           = 200;
+constexpr std::uint32_t c_tcp_rto_max           = 60000;
+constexpr std::uint8_t  c_tcp_max_retransmits   = 8;
+/// TIME-WAIT. RFC 9293 asks for 2 MSL (4 minutes); embedded stacks keep it
+/// short to reuse their few connections.
+constexpr std::uint32_t c_tcp_time_wait         = 2000;
+
+static_assert(c_tcp_connections < 256 && c_tcp_listeners < 256);
+static_assert(c_tcp_connections == 0 || (c_tcp_rx_segments >= 1 && c_tcp_tx_segments >= 2),
+              "a TCP connection needs a block to receive in and two to send in (data and FIN)");
 static_assert(c_packet_block_size >= c_packet_headroom + c_max_eth_frame_size);
 static_assert(c_packet_pool_size > c_tx_reserved_blocks + c_rx_reserved_blocks);
 static_assert(c_arp_retry_interval > 0);
