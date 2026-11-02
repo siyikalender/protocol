@@ -92,15 +92,15 @@ struct arp_table_entry
   bool is_complete() const    { return flags.test<complete>(); }
   void set_complete()         { flags.set<complete>(); }
 
-  ethernet::address   hw_addr{};
-  address             ip_addr{};
-  flags_t             flags{};
   /// Stamp of the last use: the least recently used entry is replaced
   /// when the table is full
   uint32_t            last_used = 0;
   /// Incomplete entries: tick of the last request and how many were sent
   uint32_t            last_request = 0;
   uint8_t             requests = 0;
+  flags_t             flags{};
+  ethernet::address   hw_addr{};
+  address             ip_addr{};
 };
 
 /// Received datagrams of a bound port, in arrival order

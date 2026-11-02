@@ -105,10 +105,10 @@ using  seg_flags_t = bit::storage<bit::pack<std::uint8_t, seg_syn, seg_fin, seg_
 
 struct tx_segment
 {
-  packet_id     id{};
   std::uint32_t seq     = 0;
   std::uint16_t offset  = 0;   ///< where its data starts in the block
   std::uint16_t length  = 0;   ///< bytes of data
+  packet_id     id{};
   seg_flags_t   flags{};
 
   std::uint32_t space() const
@@ -135,69 +135,85 @@ static_assert(c_data_offset + c_tcp_mss <= c_packet_block_size);
 /// Data received ahead of a gap, kept until the gap is filled
 struct ooo_segment
 {
-  packet_id     id;
   std::uint32_t seq;
+  packet_id     id;
   bool          fin;      ///< a FIN follows the data
 };
 
-/// Transmission control block (3.3.1)
+/// Transmission control block (3.3.1). Members are grouped by size, then by
+/// purpose, so the compiler adds little padding (several of these in RAM);
+/// the small ones first, where Thumb's short load and store instructions
+/// reach them.
 struct tcb
 {
+  // ---- 8 bit --------------------------------------------------------------------
+
   tcp_state             state       = tcp_state::closed;
   std::uint8_t          generation  = 0;
   bool                  app_owned   = false;          ///< the application holds a handle
   std::uint8_t          listener    = c_no_listener;  ///< not accepted yet: its listener + 1
-  ipv4::tcp::status           error       = ipv4::tcp::status::closed;
-
-  interface_designator  intf        = 0;
-  std::uint16_t         local_port  = 0;
-  endpoint              remote{};
-  ethernet::address     remote_hw{};
+  ipv4::tcp::status     error       = ipv4::tcp::status::closed;
   bool                  hw_known    = false;
   bool                  sack_ok     = false;          ///< both ends sent SACK-permitted
 
-  // Send sequence variables (3.3.1)
-  std::uint32_t         iss = 0, snd_una = 0, snd_nxt = 0, snd_wnd = 0, snd_wl1 = 0, snd_wl2 = 0;
-  std::uint16_t         snd_mss     = 0;              ///< set when the connection starts
-  haluj::bounded::vector<tx_segment, c_tcp_tx_segments> tx;
+  // Sending
   bool                  fin_wanted  = false;          ///< close(): FIN after the data
   bool                  fin_queued  = false;
   bool                  fin_sent    = false;
 
-  // Receive sequence variables
-  std::uint32_t         irs = 0, rcv_nxt = 0;
-  std::uint32_t         rcv_adv     = 0;              ///< right edge of the window announced
-  haluj::bounded::vector<packet_id, c_tcp_rx_segments> rx;
-  std::size_t           rx_bytes    = 0;
-  /// Out of order, by sequence number; shares the c_tcp_rx_segments blocks
-  /// with rx
-  haluj::bounded::vector<ooo_segment, c_tcp_rx_segments> ooo;
-  std::uint32_t         ooo_last    = 0;              ///< the latest kept: its SACK block goes first
-
   // Control segments to send
   bool                  ack_now     = false;
-  std::uint8_t          dupacks_owed = 0;            ///< RFC 5681 4.2: one ACK alone per segment out of order
+  std::uint8_t          dupacks_owed = 0;             ///< RFC 5681 4.2: one ACK alone per segment out of order
   bool                  rst_now     = false;
+  bool                  probe_now   = false;          ///< window probe
 
-  // Retransmission and persist timer (RFC 6298)
-  std::uint32_t         rto         = 0;              ///< set when the connection starts
-  std::uint32_t         timer_start = 0;
+  // Timers and loss recovery
   bool                  timer_running = false;
   std::uint8_t          retransmits = 0;
-  std::uint32_t         srtt        = 0;
-  std::uint32_t         rttvar      = 0;
   bool                  rtt_valid   = false;
   bool                  rtt_timing  = false;
-  std::uint32_t         rtt_seq     = 0;
-  std::uint32_t         rtt_start   = 0;
   std::uint8_t          dupacks     = 0;
   bool                  in_recovery = false;          ///< RFC 6582: until recover is acknowledged
   bool                  probe_sent  = false;          ///< RFC 8985: a tail loss probe waits for its ACK
-  std::uint32_t         last_send   = 0;              ///< when data went last
-  std::uint32_t         recover     = 0;
-  bool                  probe_now   = false;
 
+  // ---- 16 bit and byte arrays ---------------------------------------------------
+
+  endpoint              remote{};
+  std::uint16_t         local_port  = 0;
+  std::uint16_t         snd_mss     = 0;              ///< set when the connection starts
+  ethernet::address     remote_hw{};
+
+  // ---- 32 bit -------------------------------------------------------------------
+
+  // Send sequence variables (3.3.1)
+  std::uint32_t         iss = 0, snd_una = 0, snd_nxt = 0, snd_wnd = 0, snd_wl1 = 0, snd_wl2 = 0;
+  std::uint32_t         recover     = 0;              ///< RFC 6582: recovery ends when acknowledged
+
+  // Receive sequence variables
+  std::uint32_t         irs = 0, rcv_nxt = 0;
+  std::uint32_t         rcv_adv     = 0;              ///< right edge of the window announced
+  std::uint32_t         ooo_last    = 0;              ///< the latest kept out of order: its SACK block goes first
+  std::size_t           rx_bytes    = 0;
+
+  interface_designator  intf        = 0;
+
+  // Retransmission and persist timer (RFC 6298), tail loss probe (RFC 8985)
+  std::uint32_t         rto         = 0;              ///< set when the connection starts
+  std::uint32_t         timer_start = 0;
+  std::uint32_t         srtt        = 0;
+  std::uint32_t         rttvar      = 0;
+  std::uint32_t         rtt_seq     = 0;
+  std::uint32_t         rtt_start   = 0;
+  std::uint32_t         last_send   = 0;              ///< when data went last
   std::uint32_t         time_wait_start = 0;
+
+  // ---- blocks -------------------------------------------------------------------
+
+  haluj::bounded::vector<tx_segment, c_tcp_tx_segments> tx;
+  haluj::bounded::vector<packet_id, c_tcp_rx_segments> rx;
+  /// Out of order, by sequence number; shares the c_tcp_rx_segments blocks
+  /// with rx
+  haluj::bounded::vector<ooo_segment, c_tcp_rx_segments> ooo;
 
   bool used() const
   {
@@ -230,11 +246,11 @@ struct tcb
 
 struct listener_slot
 {
-  bool                  used = false;
   interface_designator  intf = 0;
-  std::uint16_t         port = 0;
   /// Established, waiting for accept()
   haluj::ring_buffer<std::array<ipv4::tcp::connection, c_tcp_backlog>> ready{};
+  std::uint16_t         port = 0;
+  bool                  used = false;
 };
 
 std::array<tcb, c_tcp_connections>          g_tcb{};
@@ -885,10 +901,10 @@ stored store_out_of_order(tcb& c, packet_id p, std::uint32_t seq, bool fin)
   }
 
   c.ooo_last = seq;
-  c.ooo.push_back({p, seq, fin});
+  c.ooo.push_back({.seq = seq, .id = p, .fin = fin});
   for (std::size_t j = c.ooo.size() - 1; j > at; --j)
     c.ooo[j] = c.ooo[j - 1];
-  c.ooo[at] = {p, seq, fin};
+  c.ooo[at] = {.seq = seq, .id = p, .fin = fin};
 
   ++g_stats.tcp_rx_out_of_order;
   return stored::kept;

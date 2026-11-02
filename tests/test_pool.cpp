@@ -129,7 +129,10 @@ int main()
     PROTOCOL_CHECK(g_pool.id_of(s.data()) == q);
     PROTOCOL_CHECK(g_pool.id_of(s.data() + 1535) == q);
     PROTOCOL_CHECK(g_pool.id_of(g_pool.base(p) + 2) == p);
-    PROTOCOL_CHECK(!g_pool.id_of(s.data() + 1536).has_value());   // offset/length, not data
+    // Blocks follow each other without gaps: the byte after one is the next
+    PROTOCOL_CHECK(g_pool.id_of(s.data() + 1536) == protocol::ipv4::packet_id{std::uint8_t(q.index + 1)});
+    const auto last = g_pool.storage(protocol::ipv4::packet_id{std::uint8_t(pool_type::capacity() - 1)});
+    PROTOCOL_CHECK(!g_pool.id_of(last.data() + last.size()).has_value());   // past the pool
     int elsewhere = 0;
     PROTOCOL_CHECK(!g_pool.id_of(&elsewhere).has_value());
     g_pool.reset();

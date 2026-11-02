@@ -89,11 +89,19 @@ class packet_pool
   static_assert(Headroom < BlockSize);
 
 public:
+  /// Only the bytes: the blocks follow each other without gaps (their
+  /// valid ranges are kept apart, see m_ranges)
   struct alignas(Alignment) block
   {
     std::array<std::uint8_t, BlockSize> data{};
-    std::uint16_t                       offset = 0;
-    std::uint16_t                       length = 0;
+  };
+  static_assert(sizeof(block) == BlockSize);
+
+  /// The valid bytes of a block
+  struct range
+  {
+    std::uint16_t offset = 0;
+    std::uint16_t length = 0;
   };
 
   static constexpr std::size_t capacity()   { return Count; }
@@ -118,8 +126,7 @@ public:
 
     const auto i = static_cast<std::uint8_t>(std::countr_one(m_used));
     m_used |= std::uint32_t(1) << i;
-    m_blocks[i].offset = Headroom;
-    m_blocks[i].length = 0;
+    m_ranges[i] = {Headroom, 0};
     return packet_id{i};
   }
 
@@ -143,8 +150,8 @@ public:
   /// The valid bytes of the block
   constexpr std::span<std::uint8_t> data(const packet_id p)
   {
-    block& b = m_blocks[p.index];
-    return {b.data.data() + b.offset, b.length};
+    const range& r = m_ranges[p.index];
+    return {m_blocks[p.index].data.data() + r.offset, r.length};
   }
 
   /// All bytes from the headroom to the end of the block: where a received
@@ -160,15 +167,14 @@ public:
     if (offset > BlockSize || length > BlockSize - offset)
       return false;
 
-    m_blocks[p.index].offset = static_cast<std::uint16_t>(offset);
-    m_blocks[p.index].length = static_cast<std::uint16_t>(length);
+    m_ranges[p.index] = {static_cast<std::uint16_t>(offset), static_cast<std::uint16_t>(length)};
     return true;
   }
 
   /// Shortens the valid range to \p length bytes (drops trailing padding)
   constexpr bool trim(const packet_id p, const std::size_t length)
   {
-    block& b = m_blocks[p.index];
+    range& b = m_ranges[p.index];
     if (length > b.length)
       return false;
     b.length = static_cast<std::uint16_t>(length);
@@ -179,22 +185,22 @@ public:
   /// them, nullptr when there is no room left in front.
   constexpr std::uint8_t* push_header(const packet_id p, const std::size_t size)
   {
-    block& b = m_blocks[p.index];
+    range& b = m_ranges[p.index];
     if (b.offset < size)
       return nullptr;
     b.offset = static_cast<std::uint16_t>(b.offset - size);
     b.length = static_cast<std::uint16_t>(b.length + size);
-    return b.data.data() + b.offset;
+    return m_blocks[p.index].data.data() + b.offset;
   }
 
   /// Receive: returns the first \p size valid bytes and steps over them,
   /// nullptr when fewer than \p size bytes are valid.
   constexpr std::uint8_t* pull_header(const packet_id p, const std::size_t size)
   {
-    block& b = m_blocks[p.index];
+    range& b = m_ranges[p.index];
     if (b.length < size)
       return nullptr;
-    std::uint8_t* header = b.data.data() + b.offset;
+    std::uint8_t* header = m_blocks[p.index].data.data() + b.offset;
     b.offset = static_cast<std::uint16_t>(b.offset + size);
     b.length = static_cast<std::uint16_t>(b.length - size);
     return header;
@@ -238,6 +244,7 @@ private:
   // Bit i set: block i is in use. Every member starts as zero, so a global
   // pool goes to .bss: no flash copy and no start up code.
   std::array<block, Count> m_blocks{};
+  std::array<range, Count> m_ranges{};
   std::uint32_t            m_used = 0;
 };
 
