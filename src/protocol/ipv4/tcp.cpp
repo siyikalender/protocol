@@ -662,7 +662,7 @@ void resend_holes(tcb& c)
   for (std::size_t i = 0; i < highest; ++i)
   {
     tx_segment& s = c.tx[i];
-    if (s.flags.test<seg_sent>() && !s.flags.test<seg_sacked>() && !s.flags.test<seg_resent>())
+    if (s.flags.test<seg_sent>() && !s.flags.test_any<seg_sacked, seg_resent>())
     {
       s.flags.clear<seg_sent>().set<seg_retransmitted, seg_resent>();
       c.flags.clear<flag::rtt_timing>();
@@ -1495,7 +1495,7 @@ void queue_fin(tcb& c)
   if (!c.tx.empty())
   {
     tx_segment& last = c.tx.back();
-    if (!last.flags.test<seg_sent>() && !last.flags.test<seg_syn>() && !in_flight(last.id))
+    if (!last.flags.test_any<seg_sent, seg_syn>() && !in_flight(last.id))
     {
       last.flags.set<seg_fin>();
       c.flags.set<flag::fin_queued>();
@@ -2037,7 +2037,7 @@ std::size_t tail_room(const tcb& c)
   if (c.tx.empty())
     return 0;
   const tx_segment& s = c.tx.back();
-  if (s.flags.test<seg_sent>() || s.flags.test<seg_syn>() || s.flags.test<seg_fin>() || in_flight(s.id))
+  if (s.flags.test_any<seg_sent, seg_syn, seg_fin>() || in_flight(s.id))
     return 0;
   return c.mss() > s.length ? c.mss() - s.length : 0;
 }
