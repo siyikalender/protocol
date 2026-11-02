@@ -242,10 +242,12 @@ public:
 
 private:
   // Bit i set: block i is in use. Every member starts as zero, so a global
-  // pool goes to .bss: no flash copy and no start up code.
-  std::array<block, Count> m_blocks{};
+  // pool goes to .bss: no flash copy and no start up code. The ranges come
+  // first: near the start of the pool, Thumb loads reach them with a short
+  // offset (behind the blocks they would need an extra add).
   std::array<range, Count> m_ranges{};
   std::uint32_t            m_used = 0;
+  std::array<block, Count> m_blocks{};
 };
 
 } // namespace ipv4
