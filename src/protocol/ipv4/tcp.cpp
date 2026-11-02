@@ -48,6 +48,7 @@ For more information, please refer to <http://unlicense.org>
 #include "bit/storage.hpp"
 #include "haluj/bounded/vector.hpp"
 #include "haluj/ring_buffer.hpp"
+#include "haluj/state_machine.hpp"
 
 namespace protocol
 {
@@ -90,6 +91,24 @@ enum class tcp_state : std::uint8_t
   closing,
   last_ack,
   time_wait
+};
+
+/// What moves a connection from one state to another (figure 5 of RFC
+/// 9293). The code that finds out what happened tells transition(); only
+/// transition() changes the state.
+enum class tcp_event : std::uint8_t
+{
+  open_active,    ///< connect()
+  open_passive,   ///< a SYN for a listener
+  syn_received,   ///< SYN-SENT: the peer's SYN, ours not acknowledged (simultaneous open)
+  syn_acked,      ///< our SYN acknowledged
+  fin_acked,      ///< our FIN acknowledged
+  fin_received,   ///< the peer's FIN, in order
+  close,          ///< close()
+  time_wait_over,
+  reset,          ///< a valid RST came
+  aborted,        ///< abort(), or stop() of the listener
+  timed_out       ///< retransmissions or ARP requests gave up
 };
 
 /// A segment to send, or sent and not acknowledged yet. SYN and FIN take a
@@ -368,18 +387,6 @@ void drop_buffers(tcb& c)
   for (auto& s : c.tx)
     unpin(s.id);
   c.tx.clear();
-}
-
-/// The connection is over: CLOSED. The place is free again unless the
-/// application still holds a handle (it then sees why it ended).
-void end(tcb& c, ipv4::tcp::status why)
-{
-  drop_buffers(c);
-  c.state         = tcp_state::closed;
-  c.error         = why;
-  c.flags.clear<flag::timer_running, flag::ack_now>();
-  c.dupacks_owed  = 0;
-  c.listener      = c_no_listener;   // never accepted: nobody will
 }
 
 constexpr std::uint32_t c_rx_capacity = c_tcp_rx_segments * c_tcp_mss;
@@ -771,24 +778,127 @@ bool fin_acknowledged(const tcb& c)
   return c.flags.test<flag::fin_sent>() && c.snd_una == c.snd_nxt;
 }
 
-void enter_time_wait(tcb& c)
+// ---- state transitions (3.3.2, figure 5) ---------------------------------------------
+
+// Guards and actions of the machine; every one gets (tcb&, tcp_event)
+
+/// The event is E
+template<tcp_event E>
+constexpr auto on_event = [](const tcb&, tcp_event e) { return e == E; };
+
+/// The connection ends, from any state but CLOSED: a RST came, or our side
+/// gave up
+constexpr auto ends = [](const tcb& c, tcp_event e)
 {
-  c.state           = tcp_state::time_wait;
+  return c.state != tcp_state::closed &&
+         (e == tcp_event::reset || e == tcp_event::aborted || e == tcp_event::timed_out);
+};
+
+/// Our side ends it: the peer is told, unless it has nothing left to hear
+/// (not synchronized yet, or TIME-WAIT). Runs before the state changes.
+constexpr auto tell_peer = [](tcb& c, tcp_event e)
+{
+  if ((e == tcp_event::aborted || e == tcp_event::timed_out) &&
+      c.synchronized() && c.state != tcp_state::time_wait)
+    c.flags.set<flag::rst_now>();
+};
+
+/// ESTABLISHED: an accepted connection waits for accept()
+constexpr auto enter_established = [](tcb& c, tcp_event)
+{
+  if (c.listener != c_no_listener)
+    g_listeners[c.listener - 1].ready.try_push(handle_of(c));   // room: backlog counted at SYN
+};
+
+/// FIN-WAIT-1, LAST-ACK: the FIN goes after the data queued
+constexpr auto enter_closing_side = [](tcb& c, tcp_event)
+{
+  c.flags.set<flag::fin_wanted>();
+};
+
+constexpr auto enter_time_wait = [](tcb& c, tcp_event)
+{
   c.time_wait_start = g_now;
   c.flags.clear<flag::timer_running>();
+};
+
+/// CLOSED: the place is free again unless the application still holds a
+/// handle; it then sees why the connection ended
+constexpr auto enter_closed = [](tcb& c, tcp_event e)
+{
+  drop_buffers(c);
+  c.error = e == tcp_event::reset || e == tcp_event::aborted ? ipv4::tcp::status::reset
+          : e == tcp_event::timed_out                         ? ipv4::tcp::status::timed_out
+                                                              : ipv4::tcp::status::closed;
+  c.flags.clear<flag::timer_running, flag::ack_now>();
+  c.dupacks_owed = 0;
+  c.listener     = c_no_listener;       // never accepted: nobody will
+};
+
+/// Figure 5 of RFC 9293; LISTEN is the listener table, not a state here
+constexpr auto c_machine = []
+{
+  using enum tcp_state;
+  using haluj::transition;
+  using haluj::entry;
+
+  return haluj::machine
+  (
+    haluj::graph
+    (
+      haluj::transition_any<closed>         (ends, tell_peer),
+
+      transition<closed,       syn_sent>    (on_event<tcp_event::open_active>),
+      transition<closed,       syn_received>(on_event<tcp_event::open_passive>),
+
+      transition<syn_sent,     established> (on_event<tcp_event::syn_acked>),
+      transition<syn_sent,     syn_received>(on_event<tcp_event::syn_received>),
+      transition<syn_sent,     closed>      (on_event<tcp_event::close>),
+
+      transition<syn_received, established> (on_event<tcp_event::syn_acked>),
+      transition<syn_received, fin_wait_1>  (on_event<tcp_event::close>),
+
+      transition<established,  close_wait>  (on_event<tcp_event::fin_received>),
+      transition<established,  fin_wait_1>  (on_event<tcp_event::close>),
+
+      transition<fin_wait_1,   fin_wait_2>  (on_event<tcp_event::fin_acked>),
+      transition<fin_wait_1,   closing>     (on_event<tcp_event::fin_received>),
+
+      transition<fin_wait_2,   time_wait>   (on_event<tcp_event::fin_received>),
+
+      transition<close_wait,   last_ack>    (on_event<tcp_event::close>),
+
+      transition<closing,      time_wait>   (on_event<tcp_event::fin_acked>),
+
+      transition<last_ack,     closed>      (on_event<tcp_event::fin_acked>),
+
+      // The FIN again: the wait starts over
+      transition<time_wait,    time_wait>   (on_event<tcp_event::fin_received>),
+      transition<time_wait,    closed>      (on_event<tcp_event::time_wait_over>)
+    ),
+    haluj::map
+    (
+      entry<established>(enter_established, nullptr, nullptr),
+      entry<fin_wait_1> (enter_closing_side, nullptr, nullptr),
+      entry<last_ack>   (enter_closing_side, nullptr, nullptr),
+      entry<time_wait>  (enter_time_wait, nullptr, nullptr),
+      entry<closed>     (enter_closed, nullptr, nullptr)
+    )
+  );
+}();
+
+/// The only place where a connection changes its state
+void transition(tcb& c, tcp_event e)
+{
+  c.state = c_machine(c.state, c, e);
 }
 
-/// Established after the handshake: an accepted connection waits for
-/// accept()
-void established(tcb& c, const grammar::tcp_header& th)
+/// The handshake is over: the send window starts with the peer's
+void synchronize_window(tcb& c, const grammar::tcp_header& th)
 {
-  c.state   = tcp_state::established;
   c.snd_wnd = th.window;
   c.snd_wl1 = th.sequence;
   c.snd_wl2 = th.acknowledgment;
-
-  if (c.listener != c_no_listener)
-    g_listeners[c.listener - 1].ready.try_push(handle_of(c));   // room: backlog counted at SYN
 }
 
 /// Received data in order: kept in the block, or copied to the end of the
@@ -850,24 +960,10 @@ void fin_arrived(tcb& c)
   // Nothing comes after the FIN
   while (evict_out_of_order(c)) {}
 
-  switch (c.state)
-  {
-    case tcp_state::established:
-      c.state = tcp_state::close_wait;
-      break;
-    case tcp_state::fin_wait_1:
-      if (fin_acknowledged(c))
-        enter_time_wait(c);
-      else
-        c.state = tcp_state::closing;
-      break;
-    case tcp_state::fin_wait_2:
-    case tcp_state::time_wait:
-      enter_time_wait(c);
-      break;
-    default:
-      break;
-  }
+  // FIN-WAIT-1: "if our FIN has been ACKed (perhaps in this segment)"
+  if (fin_acknowledged(c))
+    transition(c, tcp_event::fin_acked);
+  transition(c, tcp_event::fin_received);
 }
 
 /// Keeps a segment that came ahead of a gap (its payload in p, starting at
@@ -1012,7 +1108,7 @@ verdict passive_open(interface_designator id, listener_slot& l, packet_id p,
   if (c == nullptr)
     return verdict::drop;
 
-  c->state      = tcp_state::syn_received;
+  transition(*c, tcp_event::open_passive);
   c->listener   = static_cast<std::uint8_t>(li + 1);
   c->intf       = id;
   c->local_port = l.port;
@@ -1090,27 +1186,10 @@ bool process_ack(tcb& c, const grammar::tcp_header& th, std::uint32_t seg_len)
     c.snd_wl2 = ack;
   }
 
-  switch (c.state)
-  {
-    case tcp_state::fin_wait_1:
-      if (fin_acknowledged(c))
-        c.state = tcp_state::fin_wait_2;
-      break;
-    case tcp_state::closing:
-      if (fin_acknowledged(c))
-        enter_time_wait(c);
-      break;
-    case tcp_state::last_ack:
-      if (fin_acknowledged(c))
-      {
-        end(c, ipv4::tcp::status::closed);
-        return false;
-      }
-      break;
-    default:
-      break;
-  }
-  return true;
+  if (fin_acknowledged(c))
+    transition(c, tcp_event::fin_acked);
+
+  return c.state != tcp_state::closed;
 }
 
 verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
@@ -1138,7 +1217,7 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
     if (in.test<wire::tcp::RST>())
     {
       if (ack_ok)
-        end(c, ipv4::tcp::status::reset);
+        transition(c, tcp_event::reset);
       return verdict::drop;
     }
 
@@ -1154,13 +1233,14 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
       if (ack_ok)
       {
         acknowledge(c, th.acknowledgment);
-        established(c, th);
+        synchronize_window(c, th);
+        transition(c, tcp_event::syn_acked);
         c.flags.set<flag::ack_now>();
       }
       else
       {
         // Simultaneous open: our SYN goes again as SYN,ACK
-        c.state = tcp_state::syn_received;
+        transition(c, tcp_event::syn_received);
         retransmit_first(c);
       }
     }
@@ -1207,7 +1287,7 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
   if (in.test<wire::tcp::RST>())
   {
     if (seq == c.rcv_nxt)
-      end(c, ipv4::tcp::status::reset);
+      transition(c, tcp_event::reset);
     else
       c.flags.set<flag::ack_now>();                 // challenge ACK
     return verdict::drop;
@@ -1231,7 +1311,8 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
     if (!(seq_lt(c.snd_una, ack) && seq_le(ack, c.snd_nxt)))
       return reset_reply(g_interfaces[c.intf], p, c.remote_hw, c.remote, th, data_length);
     acknowledge(c, ack);
-    established(c, th);
+    synchronize_window(c, th);
+    transition(c, tcp_event::syn_acked);
   }
   else if (!process_ack(c, th, seg_len))
   {
@@ -1324,7 +1405,7 @@ void run_timers(tcb& c)
   if (c.state == tcp_state::time_wait)
   {
     if (g_now - c.time_wait_start >= c_tcp_time_wait)
-      end(c, ipv4::tcp::status::closed);
+      transition(c, tcp_event::time_wait_over);
     return;
   }
 
@@ -1395,9 +1476,7 @@ void run_timers(tcb& c)
 
   if (++c.retransmits > c_tcp_max_retransmits)
   {
-    if (c.synchronized())
-      c.flags.set<flag::rst_now>();
-    end(c, ipv4::tcp::status::timed_out);
+    transition(c, tcp_event::timed_out);
     return;
   }
 
@@ -1663,7 +1742,7 @@ void tcp_arp_failed(const address& a)
 {
   for (auto& c : g_tcb)
     if (c.state == tcp_state::syn_sent && !c.flags.test<flag::hw_known>() && c.remote.ip_addr == a)
-      end(c, ipv4::tcp::status::timed_out);
+      transition(c, tcp_event::timed_out);
 }
 
 void tcp_initialize()
@@ -1716,11 +1795,7 @@ void stop(listener l)
   for (auto& c : g_tcb)
   {
     if (c.listener == l.index + 1)
-    {
-      if (c.synchronized())
-        c.flags.set<flag::rst_now>();
-      end(c, status::reset);
-    }
+      transition(c, tcp_event::aborted);
   }
   g_listeners[l.index] = listener_slot{};
 }
@@ -1787,7 +1862,7 @@ std::optional<connection> connect(interface_designator id, const endpoint& remot
     return std::nullopt;
   }
 
-  c->state      = tcp_state::syn_sent;
+  transition(*c, tcp_event::open_active);
   c->flags.set<flag::app_owned>();
   c->intf       = id;
   c->local_port = local_port;
@@ -2084,23 +2159,7 @@ void close(connection h)
     g_packet_pool.release(o.id);
   c->ooo.clear();
 
-  switch (c->state)
-  {
-    case tcp_state::syn_sent:
-      end(*c, status::closed);
-      break;
-    case tcp_state::syn_received:
-    case tcp_state::established:
-      c->flags.set<flag::fin_wanted>();
-      c->state      = tcp_state::fin_wait_1;
-      break;
-    case tcp_state::close_wait:
-      c->flags.set<flag::fin_wanted>();
-      c->state      = tcp_state::last_ack;
-      break;
-    default:
-      break;           // closing already, or closed: the place is free now
-  }
+  transition(*c, tcp_event::close);   // closing already, or closed: the place is free now
 }
 
 void abort(connection h)
@@ -2110,10 +2169,7 @@ void abort(connection h)
     return;
 
   c->flags.clear<flag::app_owned>();
-
-  if (c->synchronized() && c->state != tcp_state::time_wait)
-    c->flags.set<flag::rst_now>();
-  end(*c, status::reset);
+  transition(*c, tcp_event::aborted);
 }
 
 void set_secret(std::uint64_t secret)
