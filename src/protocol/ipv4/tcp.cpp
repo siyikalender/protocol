@@ -615,7 +615,7 @@ void retransmit_first(tcb& c)
 {
   if (c.tx.empty() || !c.tx.front().flags.test<seg_sent>())
     return;
-  c.tx.front().flags.clear<seg_sent>().set<seg_retransmitted>().set<seg_resent>();
+  c.tx.front().flags.clear<seg_sent>().set<seg_retransmitted, seg_resent>();
   c.flags.clear<flag::rtt_timing>();   // Karn: no RTT sample from a segment sent twice
   ++g_stats.tcp_retransmits;
 }
@@ -664,7 +664,7 @@ void resend_holes(tcb& c)
     tx_segment& s = c.tx[i];
     if (s.flags.test<seg_sent>() && !s.flags.test<seg_sacked>() && !s.flags.test<seg_resent>())
     {
-      s.flags.clear<seg_sent>().set<seg_retransmitted>().set<seg_resent>();
+      s.flags.clear<seg_sent>().set<seg_retransmitted, seg_resent>();
       c.flags.clear<flag::rtt_timing>();
       ++g_stats.tcp_retransmits;
     }
