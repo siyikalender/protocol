@@ -140,6 +140,34 @@ struct ooo_segment
   bool          fin;      ///< a FIN follows the data
 };
 
+/// Yes/no state of a connection: bits of tcb::flags
+namespace flag
+{
+  struct app_owned     : bit::field<0>  {};  ///< the application holds a handle
+  struct hw_known      : bit::field<1>  {};  ///< remote_hw is known
+  struct sack_ok       : bit::field<2>  {};  ///< both ends sent SACK-permitted
+  // Sending
+  struct fin_wanted    : bit::field<3>  {};  ///< close(): FIN after the data
+  struct fin_queued    : bit::field<4>  {};
+  struct fin_sent      : bit::field<5>  {};
+  // Control segments to send
+  struct ack_now       : bit::field<6>  {};
+  struct rst_now       : bit::field<7>  {};
+  struct probe_now     : bit::field<8>  {};  ///< window probe
+  // Timers and loss recovery
+  struct timer_running : bit::field<9>  {};
+  struct rtt_valid     : bit::field<10> {};
+  struct rtt_timing    : bit::field<11> {};
+  struct in_recovery   : bit::field<12> {};  ///< RFC 6582: until recover is acknowledged
+  struct probe_sent    : bit::field<13> {};  ///< RFC 8985: a tail loss probe waits for its ACK
+}
+
+using tcb_flags_t = bit::storage<bit::pack<std::uint16_t,
+  flag::app_owned, flag::hw_known, flag::sack_ok,
+  flag::fin_wanted, flag::fin_queued, flag::fin_sent,
+  flag::ack_now, flag::rst_now, flag::probe_now,
+  flag::timer_running, flag::rtt_valid, flag::rtt_timing, flag::in_recovery, flag::probe_sent>>;
+
 /// Transmission control block (3.3.1). Members are grouped by size, then by
 /// purpose, so the compiler adds little padding (several of these in RAM);
 /// the small ones first, where Thumb's short load and store instructions
@@ -150,34 +178,15 @@ struct tcb
 
   tcp_state             state       = tcp_state::closed;
   std::uint8_t          generation  = 0;
-  bool                  app_owned   = false;          ///< the application holds a handle
   std::uint8_t          listener    = c_no_listener;  ///< not accepted yet: its listener + 1
   ipv4::tcp::status     error       = ipv4::tcp::status::closed;
-  bool                  hw_known    = false;
-  bool                  sack_ok     = false;          ///< both ends sent SACK-permitted
-
-  // Sending
-  bool                  fin_wanted  = false;          ///< close(): FIN after the data
-  bool                  fin_queued  = false;
-  bool                  fin_sent    = false;
-
-  // Control segments to send
-  bool                  ack_now     = false;
   std::uint8_t          dupacks_owed = 0;             ///< RFC 5681 4.2: one ACK alone per segment out of order
-  bool                  rst_now     = false;
-  bool                  probe_now   = false;          ///< window probe
-
-  // Timers and loss recovery
-  bool                  timer_running = false;
   std::uint8_t          retransmits = 0;
-  bool                  rtt_valid   = false;
-  bool                  rtt_timing  = false;
   std::uint8_t          dupacks     = 0;
-  bool                  in_recovery = false;          ///< RFC 6582: until recover is acknowledged
-  bool                  probe_sent  = false;          ///< RFC 8985: a tail loss probe waits for its ACK
 
   // ---- 16 bit and byte arrays ---------------------------------------------------
 
+  tcb_flags_t           flags{};
   endpoint              remote{};
   std::uint16_t         local_port  = 0;
   std::uint16_t         snd_mss     = 0;              ///< set when the connection starts
@@ -217,7 +226,8 @@ struct tcb
 
   bool used() const
   {
-    return state != tcp_state::closed || app_owned || listener != c_no_listener || rst_now;
+    return state != tcp_state::closed || listener != c_no_listener ||
+           flags.test_any<flag::app_owned, flag::rst_now>();
   }
 
   bool synchronized() const
@@ -240,7 +250,7 @@ struct tcb
   /// Data received is dropped: the application closed and reads no more
   bool discards() const
   {
-    return !app_owned && listener == c_no_listener;
+    return !flags.test<flag::app_owned>() && listener == c_no_listener;
   }
 };
 
@@ -322,7 +332,7 @@ tcb* from_handle(ipv4::tcp::connection h)
   if (h.index >= g_tcb.size())
     return nullptr;
   tcb& c = g_tcb[h.index];
-  return (c.generation == h.generation && c.app_owned) ? &c : nullptr;
+  return (c.generation == h.generation && c.flags.test<flag::app_owned>()) ? &c : nullptr;
 }
 
 /// A free control block, reset
@@ -367,8 +377,7 @@ void end(tcb& c, ipv4::tcp::status why)
   drop_buffers(c);
   c.state         = tcp_state::closed;
   c.error         = why;
-  c.timer_running = false;
-  c.ack_now       = false;
+  c.flags.clear<flag::timer_running, flag::ack_now>();
   c.dupacks_owed  = 0;
   c.listener      = c_no_listener;   // never accepted: nobody will
 }
@@ -492,7 +501,7 @@ struct sack_list
 sack_list sack_of(const tcb& c)
 {
   sack_list l;
-  if (!c.sack_ok)
+  if (!c.flags.test<flag::sack_ok>())
     return l;
 
   std::uint32_t ranges[2 * c_tcp_rx_segments];
@@ -543,7 +552,7 @@ void write_segment(tcb& c, packet_id p, std::uint32_t seq, control_t control, bo
   f.seq            = seq;
   f.control        = control.value();
   f.syn_options    = syn;
-  f.sack_permitted = c.state == tcp_state::syn_sent || c.sack_ok;   // offered, or answered
+  f.sack_permitted = c.state == tcp_state::syn_sent || c.flags.test<flag::sack_ok>();   // offered, or answered
   if (sack != nullptr)
   {
     f.sack_blocks = sack->blocks;
@@ -600,7 +609,7 @@ void retransmit_first(tcb& c)
   if (c.tx.empty() || !c.tx.front().flags.test<seg_sent>())
     return;
   c.tx.front().flags.clear<seg_sent>().set<seg_retransmitted>().set<seg_resent>();
-  c.rtt_timing = false;   // Karn: no RTT sample from a segment sent twice
+  c.flags.clear<flag::rtt_timing>();   // Karn: no RTT sample from a segment sent twice
   ++g_stats.tcp_retransmits;
 }
 
@@ -649,7 +658,7 @@ void resend_holes(tcb& c)
     if (s.flags.test<seg_sent>() && !s.flags.test<seg_sacked>() && !s.flags.test<seg_resent>())
     {
       s.flags.clear<seg_sent>().set<seg_retransmitted>().set<seg_resent>();
-      c.rtt_timing = false;
+      c.flags.clear<flag::rtt_timing>();
       ++g_stats.tcp_retransmits;
     }
   }
@@ -658,11 +667,11 @@ void resend_holes(tcb& c)
 /// RFC 6298 2.2 / 2.3
 void rtt_sample(tcb& c, std::uint32_t r)
 {
-  if (!c.rtt_valid)
+  if (!c.flags.test<flag::rtt_valid>())
   {
     c.srtt      = r;
     c.rttvar    = r / 2;
-    c.rtt_valid = true;
+    c.flags.set<flag::rtt_valid>();
   }
   else
   {
@@ -678,18 +687,18 @@ void rtt_sample(tcb& c, std::uint32_t r)
 /// The peer acknowledged everything before ack (3.10.7.4, fifth check)
 void acknowledge(tcb& c, std::uint32_t ack)
 {
-  if (c.rtt_timing && seq_ge(ack, c.rtt_seq))
+  if (c.flags.test<flag::rtt_timing>() && seq_ge(ack, c.rtt_seq))
   {
     rtt_sample(c, g_now - c.rtt_start);
-    c.rtt_timing = false;
+    c.flags.clear<flag::rtt_timing>();
   }
 
   // RFC 6582 3.2: an ACK short of recover shows the next hole
   bool partial = false;
-  if (c.in_recovery)
+  if (c.flags.test<flag::in_recovery>())
   {
     if (seq_ge(ack, c.recover))
-      c.in_recovery = false;
+      c.flags.clear<flag::in_recovery>();
     else
       partial = true;
   }
@@ -719,13 +728,13 @@ void acknowledge(tcb& c, std::uint32_t ack)
   }
 
   c.snd_una     = ack;
-  c.probe_sent  = false;
+  c.flags.clear<flag::probe_sent>();
   c.retransmits = 0;
   c.dupacks     = 0;
-  c.rto         = c.rtt_valid ? c.rto : c_tcp_rto_initial;
+  c.rto         = c.flags.test<flag::rtt_valid>() ? c.rto : c_tcp_rto_initial;
 
   if (c.snd_una == c.snd_nxt)
-    c.timer_running = false;
+    c.flags.clear<flag::timer_running>();
   else
     c.timer_start = g_now;          // RFC 6298 5.3
 
@@ -753,20 +762,20 @@ void enter_recovery(tcb& c)
     s.flags.clear<seg_resent>();
   retransmit_first(c);
   resend_holes(c);
-  c.in_recovery = true;
+  c.flags.set<flag::in_recovery>();
   c.recover     = c.snd_nxt;
 }
 
 bool fin_acknowledged(const tcb& c)
 {
-  return c.fin_sent && c.snd_una == c.snd_nxt;
+  return c.flags.test<flag::fin_sent>() && c.snd_una == c.snd_nxt;
 }
 
 void enter_time_wait(tcb& c)
 {
   c.state           = tcp_state::time_wait;
   c.time_wait_start = g_now;
-  c.timer_running   = false;
+  c.flags.clear<flag::timer_running>();
 }
 
 /// Established after the handshake: an accepted connection waits for
@@ -836,7 +845,7 @@ stored store_data(tcb& c, packet_id p, bool fresh = true)
 void fin_arrived(tcb& c)
 {
   c.rcv_nxt += 1;
-  c.ack_now  = true;
+  c.flags.set<flag::ack_now>();
 
   // Nothing comes after the FIN
   while (evict_out_of_order(c)) {}
@@ -1009,7 +1018,7 @@ verdict passive_open(interface_designator id, listener_slot& l, packet_id p,
   c->local_port = l.port;
   c->remote     = remote;
   c->remote_hw  = hw;
-  c->hw_known   = true;
+  c->flags.set<flag::hw_known>();
   c->irs        = th.sequence;
   c->rcv_nxt    = th.sequence + 1;
   c->rcv_adv    = c->rcv_nxt;
@@ -1020,7 +1029,7 @@ verdict passive_open(interface_designator id, listener_slot& l, packet_id p,
   c->snd_wl1    = th.sequence;
   if (th.mss != 0)
     c->snd_mss  = th.mss;
-  c->sack_ok    = th.sack_permitted;
+  c->flags.assign<flag::sack_ok>(th.sack_permitted);
 
   queue_control(*c, p, true);   // SYN,ACK; data in the SYN is not kept
   return verdict::keep;
@@ -1037,7 +1046,7 @@ bool process_ack(tcb& c, const grammar::tcp_header& th, std::uint32_t seg_len)
 
   if (seq_gt(ack, c.snd_nxt))
   {
-    c.ack_now = true;                   // acknowledges what was not sent
+    c.flags.set<flag::ack_now>();                   // acknowledges what was not sent
     return false;
   }
 
@@ -1047,7 +1056,7 @@ bool process_ack(tcb& c, const grammar::tcp_header& th, std::uint32_t seg_len)
 
   // An ACK with new SACK information counts as a duplicate even when it
   // carries data or a new window (RFC 6675 2)
-  const bool sacked_more = c.sack_ok && update_scoreboard(c, th);
+  const bool sacked_more = c.flags.test<flag::sack_ok>() && update_scoreboard(c, th);
 
   if (ack == una && c.snd_una != c.snd_nxt &&
       (sacked_more || (seg_len == 0 && th.window == c.snd_wnd)))
@@ -1055,20 +1064,20 @@ bool process_ack(tcb& c, const grammar::tcp_header& th, std::uint32_t seg_len)
     // Duplicate ACK: enough in a row, the first segment was lost
     if (c.dupacks < 0xFF)
       ++c.dupacks;
-    if (!c.in_recovery && c.dupacks >= duplicate_threshold(c))
+    if (!c.flags.test<flag::in_recovery>() && c.dupacks >= duplicate_threshold(c))
       enter_recovery(c);
   }
 
   // The first segment is lost when enough after it have arrived
   // (RFC 6675 IsLost), however many ACKs told so
-  if (!c.in_recovery && sacked_more)
+  if (!c.flags.test<flag::in_recovery>() && sacked_more)
   {
     const auto sacked = std::count_if(c.tx.begin(), c.tx.end(), [](const tx_segment& s)
                                       { return s.flags.test<seg_sacked>(); });
     if (sacked >= duplicate_threshold(c))
       enter_recovery(c);
   }
-  else if (c.in_recovery && sacked_more)
+  else if (c.flags.test<flag::in_recovery>() && sacked_more)
   {
     resend_holes(c);
   }
@@ -1140,13 +1149,13 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
       c.rcv_adv = c.rcv_nxt;
       if (th.mss != 0)
         c.snd_mss = th.mss;
-      c.sack_ok = th.sack_permitted;
+      c.flags.assign<flag::sack_ok>(th.sack_permitted);
 
       if (ack_ok)
       {
         acknowledge(c, th.acknowledgment);
         established(c, th);
-        c.ack_now = true;
+        c.flags.set<flag::ack_now>();
       }
       else
       {
@@ -1189,7 +1198,7 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
       // its ACK must still open ours, or both sides wait for each other
       if (in.test<wire::tcp::ACK>() && !in.test<wire::tcp::SYN>() && c.synchronized())
         process_ack(c, th, seg_len);
-      c.ack_now = true;
+      c.flags.set<flag::ack_now>();
     }
     return verdict::drop;
   }
@@ -1200,14 +1209,14 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
     if (seq == c.rcv_nxt)
       end(c, ipv4::tcp::status::reset);
     else
-      c.ack_now = true;                 // challenge ACK
+      c.flags.set<flag::ack_now>();                 // challenge ACK
     return verdict::drop;
   }
 
   // ---- fourth: SYN (RFC 5961 4.2) ----
   if (in.test<wire::tcp::SYN>())
   {
-    c.ack_now = true;                   // challenge ACK
+    c.flags.set<flag::ack_now>();                   // challenge ACK
     return verdict::drop;
   }
 
@@ -1250,7 +1259,7 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
       else if (s == stored::refused)
         ++g_stats.tcp_rx_refused;
     }
-    c.ack_now = true;
+    c.flags.set<flag::ack_now>();
     return v;
   }
 
@@ -1258,7 +1267,7 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
   {
     if (!takes_data)
     {
-      c.ack_now    = true;              // no more data expected
+      c.flags.set<flag::ack_now>();              // no more data expected
       fin_in_order = false;
     }
     else
@@ -1294,7 +1303,7 @@ verdict segment_arrives(tcb& c, packet_id p, const grammar::tcp_header& th,
             v = verdict::keep;
         }
       }
-      c.ack_now = true;
+      c.flags.set<flag::ack_now>();
     }
   }
 
@@ -1326,13 +1335,13 @@ void run_timers(tcb& c)
 
   if (!in_flight_data && !persist)
   {
-    c.timer_running = false;
+    c.flags.clear<flag::timer_running>();
     return;
   }
 
-  if (!c.timer_running)
+  if (!c.flags.test<flag::timer_running>())
   {
-    c.timer_running = true;
+    c.flags.set<flag::timer_running>();
     c.timer_start   = g_now;
     return;
   }
@@ -1343,7 +1352,8 @@ void run_timers(tcb& c)
   // a lost retransmission leaves nothing that could bring an ACK (RFC 8985
   // keeps probes out of recovery; a duplicate costs one segment, a timeout
   // costs at least c_tcp_rto_min). With SACK only, once per new ACK.
-  if (!persist && c.sack_ok && c.rtt_valid && !c.probe_sent && c.synchronized())
+  if (!persist && c.flags.test_all<flag::sack_ok, flag::rtt_valid>() && !c.flags.test<flag::probe_sent>() &&
+      c.synchronized())
   {
     const auto sent = std::count_if(c.tx.begin(), c.tx.end(), [](const tx_segment& s)
                                     { return s.flags.test<seg_sent>() && s.length > 0; });
@@ -1355,17 +1365,17 @@ void run_timers(tcb& c)
     {
       for (std::size_t k = 0; k < c.tx.size(); ++k)
       {
-        tx_segment& s = c.tx[c.in_recovery ? k : c.tx.size() - 1 - k];
+        tx_segment& s = c.tx[c.flags.test<flag::in_recovery>() ? k : c.tx.size() - 1 - k];
         if (s.flags.test<seg_sent>() && !s.flags.test<seg_sacked>() && s.length > 0)
         {
           s.flags.clear<seg_sent>().set<seg_retransmitted>();
-          c.rtt_timing = false;
+          c.flags.clear<flag::rtt_timing>();
           ++g_stats.tcp_retransmits;
           ++g_stats.tcp_loss_probes;
           break;
         }
       }
-      c.probe_sent  = true;
+      c.flags.set<flag::probe_sent>();
       c.timer_start = g_now;      // the timeout counts from the probe
       return;
     }
@@ -1379,14 +1389,14 @@ void run_timers(tcb& c)
 
   if (persist)
   {
-    c.probe_now = true;   // window probe (3.8.6.1); the peer has not gone
+    c.flags.set<flag::probe_now>();   // window probe (3.8.6.1); the peer has not gone
     return;
   }
 
   if (++c.retransmits > c_tcp_max_retransmits)
   {
     if (c.synchronized())
-      c.rst_now = true;
+      c.flags.set<flag::rst_now>();
     end(c, ipv4::tcp::status::timed_out);
     return;
   }
@@ -1400,7 +1410,7 @@ void run_timers(tcb& c)
 /// The FIN close() asked for, after the data queued
 void queue_fin(tcb& c)
 {
-  if (!c.fin_wanted || c.fin_queued)
+  if (!c.flags.test<flag::fin_wanted>() || c.flags.test<flag::fin_queued>())
     return;
 
   if (!c.tx.empty())
@@ -1409,7 +1419,7 @@ void queue_fin(tcb& c)
     if (!last.flags.test<seg_sent>() && !last.flags.test<seg_syn>() && !in_flight(last.id))
     {
       last.flags.set<seg_fin>();
-      c.fin_queued = true;
+      c.flags.set<flag::fin_queued>();
       return;
     }
   }
@@ -1420,7 +1430,7 @@ void queue_fin(tcb& c)
   if (auto p = g_packet_pool.acquire())
   {
     queue_control(c, *p, false);
-    c.fin_queued = true;
+    c.flags.set<flag::fin_queued>();
   }
 }
 
@@ -1464,24 +1474,24 @@ std::optional<packet_id> next_segment(tcb& c)
     if (is_new)
     {
       c.snd_nxt = s.end();
-      if (!c.rtt_timing && !s.flags.test<seg_retransmitted>())
+      if (!c.flags.test<flag::rtt_timing>() && !s.flags.test<seg_retransmitted>())
       {
-        c.rtt_timing = true;
+        c.flags.set<flag::rtt_timing>();
         c.rtt_seq    = s.end();
         c.rtt_start  = g_now;
       }
     }
 
     if (s.flags.test<seg_fin>())
-      c.fin_sent = true;
+      c.flags.set<flag::fin_sent>();
 
-    if (!c.timer_running)
+    if (!c.flags.test<flag::timer_running>())
     {
-      c.timer_running = true;
+      c.flags.set<flag::timer_running>();
       c.timer_start   = g_now;
     }
 
-    c.ack_now = false;          // the segment carries the ACK
+    c.flags.clear<flag::ack_now>();          // the segment carries the ACK
     return s.id;
   }
 
@@ -1491,14 +1501,14 @@ std::optional<packet_id> next_segment(tcb& c)
 std::optional<packet_id> next_frame(tcb& c)
 {
   // Waiting for the peer's hardware address (connect())
-  if (!c.hw_known && c.state == tcp_state::syn_sent)
+  if (!c.flags.test<flag::hw_known>() && c.state == tcp_state::syn_sent)
   {
     arp_table_entry* e = find_arp_entry(c.remote.ip_addr);
 
     if (e != nullptr && e->is_complete())
     {
       c.remote_hw = e->hw_addr;
-      c.hw_known  = true;
+      c.flags.set<flag::hw_known>();
     }
     else
     {
@@ -1508,13 +1518,13 @@ std::optional<packet_id> next_frame(tcb& c)
     }
   }
 
-  if (c.rst_now)
+  if (c.flags.test<flag::rst_now>())
   {
     // abort() or too many retransmissions: one RST, then the place is free
     auto p = control_segment(c, c.snd_nxt, control_t().set<wire::tcp::RST>());
     if (p)
     {
-      c.rst_now = false;
+      c.flags.clear<flag::rst_now>();
       ++g_stats.tcp_resets_sent;
     }
     return p;
@@ -1537,7 +1547,7 @@ std::optional<packet_id> next_frame(tcb& c)
     if (p)
     {
       --c.dupacks_owed;
-      c.ack_now = false;
+      c.flags.clear<flag::ack_now>();
     }
     return p;
   }
@@ -1545,20 +1555,20 @@ std::optional<packet_id> next_frame(tcb& c)
   if (auto p = next_segment(c))
     return p;
 
-  if (c.probe_now && c.synchronized())
+  if (c.flags.test<flag::probe_now>() && c.synchronized())
   {
     // An old sequence number makes the peer answer with its window
     auto p = control_segment(c, c.snd_nxt - 1, control_t().set<wire::tcp::ACK>());
     if (p)
-      c.probe_now = false;
+      c.flags.clear<flag::probe_now>();
     return p;
   }
 
-  if (c.ack_now && c.state != tcp_state::closed && c.state != tcp_state::syn_sent)
+  if (c.flags.test<flag::ack_now>() && c.state != tcp_state::closed && c.state != tcp_state::syn_sent)
   {
     auto p = control_segment(c, c.snd_nxt, control_t().set<wire::tcp::ACK>());
     if (p)
-      c.ack_now = false;
+      c.flags.clear<flag::ack_now>();
     return p;
   }
 
@@ -1645,14 +1655,14 @@ bool tcp_waiting_for(const address& a)
 {
   return std::any_of(g_tcb.begin(), g_tcb.end(), [&](const tcb& c)
   {
-    return c.state == tcp_state::syn_sent && !c.hw_known && c.remote.ip_addr == a;
+    return c.state == tcp_state::syn_sent && !c.flags.test<flag::hw_known>() && c.remote.ip_addr == a;
   });
 }
 
 void tcp_arp_failed(const address& a)
 {
   for (auto& c : g_tcb)
-    if (c.state == tcp_state::syn_sent && !c.hw_known && c.remote.ip_addr == a)
+    if (c.state == tcp_state::syn_sent && !c.flags.test<flag::hw_known>() && c.remote.ip_addr == a)
       end(c, ipv4::tcp::status::timed_out);
 }
 
@@ -1708,7 +1718,7 @@ void stop(listener l)
     if (c.listener == l.index + 1)
     {
       if (c.synchronized())
-        c.rst_now = true;
+        c.flags.set<flag::rst_now>();
       end(c, status::reset);
     }
   }
@@ -1727,7 +1737,7 @@ std::optional<connection> accept(listener l)
     if (c.generation == h.generation && c.listener == l.index + 1 && c.state != tcp_state::closed)
     {
       c.listener  = c_no_listener;
-      c.app_owned = true;
+      c.flags.set<flag::app_owned>();
       return h;
     }
   }
@@ -1778,7 +1788,7 @@ std::optional<connection> connect(interface_designator id, const endpoint& remot
   }
 
   c->state      = tcp_state::syn_sent;
-  c->app_owned  = true;
+  c->flags.set<flag::app_owned>();
   c->intf       = id;
   c->local_port = local_port;
   c->remote     = remote;
@@ -1789,7 +1799,7 @@ std::optional<connection> connect(interface_designator id, const endpoint& remot
   if (arp_table_entry* e = find_arp_entry(remote.ip_addr); e != nullptr && e->is_complete())
   {
     c->remote_hw = e->hw_addr;
-    c->hw_known  = true;
+    c->flags.set<flag::hw_known>();
     touch(*e);
   }
   else if (e == nullptr)
@@ -1846,7 +1856,7 @@ void reading_done(tcb& c)
   const std::uint32_t current = seq_gt(c.rcv_adv, c.rcv_nxt) ? c.rcv_adv - c.rcv_nxt : 0;
 
   if (c.synchronized() && free >= current + std::min<std::uint32_t>(c_tcp_mss, c_rx_capacity / 2))
-    c.ack_now = true;
+    c.flags.set<flag::ack_now>();
 }
 
 void pop_front_rx(tcb& c)
@@ -1907,7 +1917,8 @@ namespace
 
 bool can_send(const tcb& c)
 {
-  return (c.state == tcp_state::established || c.state == tcp_state::close_wait) && !c.fin_wanted;
+  return (c.state == tcp_state::established || c.state == tcp_state::close_wait) &&
+         !c.flags.test<flag::fin_wanted>();
 }
 
 /// Blocks data to send leaves free: the next received frame and, while a
@@ -2062,7 +2073,7 @@ void close(connection h)
   if (c == nullptr)
     return;
 
-  c->app_owned = false;
+  c->flags.clear<flag::app_owned>();
 
   // Data received and not read is dropped
   for (packet_id p : c->rx)
@@ -2080,11 +2091,11 @@ void close(connection h)
       break;
     case tcp_state::syn_received:
     case tcp_state::established:
-      c->fin_wanted = true;
+      c->flags.set<flag::fin_wanted>();
       c->state      = tcp_state::fin_wait_1;
       break;
     case tcp_state::close_wait:
-      c->fin_wanted = true;
+      c->flags.set<flag::fin_wanted>();
       c->state      = tcp_state::last_ack;
       break;
     default:
@@ -2098,10 +2109,10 @@ void abort(connection h)
   if (c == nullptr)
     return;
 
-  c->app_owned = false;
+  c->flags.clear<flag::app_owned>();
 
   if (c->synchronized() && c->state != tcp_state::time_wait)
-    c->rst_now = true;
+    c->flags.set<flag::rst_now>();
   end(*c, status::reset);
 }
 
